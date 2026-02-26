@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+	<title>Test</title>
+	<script src="./qwebchannel.js"></script>
+	<script src="./vue.js"></script>
+	<script src="./axios.min.js"></script>
+	<link rel="stylesheet" type="text/css" href='./utils/element-ui/index.css'>
+	<script src="./utils/vconsole.min.js"></script>
+	<!-- 引入组件库 -->
+	<script src="./utils/element-ui/index.js"></script>
+	<script src="./utils/qrcode.js"></script>
+	<!-- <script src="./utils/service.js"></script> -->
+	<script src="./utils/classService.js"></script>
+	<script src="./services/apiService.js"></script>
+	<script src="./view/test.js"></script>
+	<link rel="stylesheet" type="text/css" href="./assets/css/index_style.css">
+</head>
+
+<body>
+	<div id="app" class="main_wrap" v-cloak>
+		<!--首页 -->
+		<div class="home" v-show="stepPage=='home'">
+			<div class="home_left">
+				<div class="home_left_top">
+					<div class="home_left_add_wrap">
+						<div class="home_left_add_chose" style="background-color: lightgray;" @click="clickSet()">
+							<div style="font-size: 10px;">设置</div>
+							<img src="./assets/img/set.png" style="width: 45px;margin-left: 5px;" />
+						</div>
+						<div class="home_left_add_chose" @click="addPlatform()">
+							<div style="font-size: 10px;">添加平台</div>
+							<img src="./assets/img/add.png" style="width: 35px;margin-left: 5px;" />
+						</div>
+					</div>
+				</div>
+				<!--		平台区域			-->
+				<div class="home_left_center">
+					<div v-for="item in all_platforms" :key="item.id" class="home_left_center_item">
+						<div :class="item.status ? 'home_left_bt_chose' : 'home_left_bt'" @click="clickSinglePlatform(item)">
+													{{item.platform_name}}-{{ item.alias_name }}
+						</div>
+						<div class="home_left_center_delete" @click="deletePlatformItem(item)">删除</div>
+						<div :class="item.status ? 'home_left_center_stop' : 'home_left_center_start'"  @click="startPlatformService(item)">{{item.status?'停止':'启动'}}</div>
+
+					</div>
+				</div>
+				<!--		平台区域end			-->				
+				<div class="home_left_bottom_wrap">
+					<div :class="is_human  ? 'home_left_bottom_enable' : 'home_left_bottom'" class="home_left_bottom"
+						@click="transferType">
+						{{is_human?'恢复介入':'暂停介入'}}
+					</div>
+				</div>
+
+			</div>
+			<div class="home_right">
+				<div class="home_right_top">
+					<div class="home_right_update" @click="updatePlatform()" v-show="current_single_platform.alias_name">修改</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">别名:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.alias_name?current_single_platform.alias_name:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">转交人:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.transfrom_name?current_single_platform.transfrom_name:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">转交触发关键词:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.transfrom_keywork?current_single_platform.transfrom_keywork:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">指定回复人:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.designated_person?current_single_platform.designated_person:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">问候语:</div>
+						<div class="home_right_top_ever_value">
+							<el-checkbox @change="handleCheckedGreetingsChange()" v-model="current_single_platform.checked_greetings" :true-label="1" :false-label="0">启用:</el-checkbox>
+							<span class="text-ellipsis">{{current_single_platform.greetings?current_single_platform.greetings:'无'}}</span>
+						</div>
+					</div>
+					<div class="home_right_top_ever"
+						 v-show="current_single_platform.platform_type == 'pdd' || current_single_platform.platform_type == 'dd'">
+						<div class="home_right_top_ever_name">用户名:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.username?current_single_platform.username:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever"
+						 v-show="current_single_platform.platform_type == 'pdd' || current_single_platform.platform_type == 'dd'">
+						<div class="home_right_top_ever_name">密码:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.pwd?current_single_platform.pwd:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever"
+						 v-show="current_single_platform.platform_type == 'pdd' || current_single_platform.platform_type == 'dd'">
+						<div class="home_right_top_ever_name">密码登录:</div>
+						<div class="home_right_top_ever_value"><el-checkbox  @change="handleCheckedPwdLoginChange()" v-model="current_single_platform.checked_pwd_login" :true-label="1" :false-label="0">启用:</el-checkbox></div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">飞书提醒:</div>
+						<div class="home_right_top_ever_value">
+							<el-checkbox  @change="handleCheckedFeishuChange()" v-model="current_single_platform.checked_feishu" :true-label="1" :false-label="0">启用:</el-checkbox>
+							<span class="text-ellipsis">{{current_single_platform.feishu_url?current_single_platform.feishu_url:'无'}}</span>
+						</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">定时刷新:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.refresh_interval?current_single_platform.refresh_interval:'无'}}</div>
+					</div>
+					<div class="home_right_top_ever">
+						<div class="home_right_top_ever_name">智能体id:</div>
+						<div class="home_right_top_ever_value">{{current_single_platform.token_id?current_single_platform.token_id:'无'}}</div>
+					</div>
+				</div>
+				<div class="home_right_bottom" ref="messages">
+					<div style="font-size: 12px" v-html="chatMsg"></div>
+				</div>
+
+			</div>
+		</div>
+		<!--	添加平台	-->
+		<el-dialog title="添加平台" :visible.sync="dialogVisibleAddPlatform" :close-on-click-modal="false" width="95%"
+			top="1vh">
+			<div class="dialog_platform_top">
+				<div class="dialog_platform_wrap">
+<!--					<div :class="add_platform_info.platform_type === 'vx' ? 'dialog_platform_chose' : 'dialog_platform_normal'"-->
+<!--						@click="clickPlatform('vx','微信')">微信</div>-->
+					<div :class="add_platform_info.platform_type === 'pdd' ? 'dialog_platform_chose' : 'dialog_platform_normal'"
+						@click="clickPlatform('pdd','拼多多')">拼多多</div>
+					<div :class="add_platform_info.platform_type === 'qn' ? 'dialog_platform_chose' : 'dialog_platform_normal'"
+						@click="clickPlatform('qn','千牛')">千牛</div>
+					<div :class="add_platform_info.platform_type === 'dd' ? 'dialog_platform_chose' : 'dialog_platform_normal'"
+						 @click="clickPlatform('dd','抖店')">抖店</div>
+					<div :class="add_platform_info.platform_type === 'wxxd' ? 'dialog_platform_chose' : 'dialog_platform_normal'"
+						@click="clickPlatform('wxxd','微信小店')">微信小店</div>
+					<div :class="add_platform_info.platform_type === 'sph' ? 'dialog_platform_chose' : 'dialog_platform_normal'"
+						@click="clickPlatform('sph','视频号')">视频号</div>
+					<!--					<div :class="platform_type === 'zh' ? 'home_left_bt_chose' : 'home_left_bt'" @click="clickPlatform('zh')">知乎</div>						-->
+					<!--					<div :class="platform_type === 'xhs' ? 'home_left_bt_chose' : 'home_left_bt'" @click="clickPlatform('xhs')">小红书</div>-->
+					<!--					<div :class="platform_type === 'jd' ? 'home_left_bt_chose' : 'home_left_bt'" @click="clickPlatform('jd')">京东</div>		-->
+					<!--					<div :class="platform_type === 'xy' ? 'home_left_bt_chose' : 'home_left_bt'" @click="clickPlatform('xy')">闲鱼</div>-->
+				</div>
+				<div class="dialog_platform_center">
+					<div class="home_right_top_item">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="需要添加下方表格里对应的智能体平台" placement="right">
+								<span>智能体(❔):</span>
+							</el-tooltip></div>
+						<div style="display: flex;justify-content: flex-start;width: 80%;">
+							{{add_platform_info.token_type_name}}/{{add_platform_info.token_id}}<div
+								v-show="add_platform_info.bot_id" style="cursor: pointer;color:blue;margin-left: 10px;" @click="deleteAgentToken">删除</div>
+						</div>
+
+					</div>
+					<div class="home_right_top_item">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="用于您多开平台记忆的别名称呼" placement="right">
+								<span>别名(❔):</span>
+							</el-tooltip></div>
+						<el-input v-model="add_platform_info.alias_name" placeholder="填写别名(四个字以内)"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						v-show="add_platform_info.platform_type !== 'vx' &&  add_platform_info.platform_type !== 'sph'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="您有问题需要转接给其他客服的账号名称,填写多个账号会依次查询每个账号,直到找到符合条件的第一个账号,千牛转发到组示例:[组]客服1组,组名前加[组]就自动转发组,多个组用逗号隔开,也可以转发人和转发组混用,示例：客服来来,客服小李,[组]客服1组,[组]客服2组" placement="right">
+								<span>转交人(❔):</span>
+							</el-tooltip></div>
+						<el-input v-model="add_platform_info.transfer_name" placeholder="填写转交人账号名称,多个账号用逗号隔开,千牛转发组示例:[组]客服1组,组名前加[组]"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						v-show="add_platform_info.platform_type !== 'vx' &&  add_platform_info.platform_type !== 'sph'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="如果检测到客户发的消息包含关键词触发转交" placement="right">
+								<span>转交触发关键词(❔):</span>
+							</el-tooltip></div>
+						<el-input v-model="add_platform_info.transfer_keyword"
+							placeholder="填写转交触发的关键词,用逗号隔开"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						 v-show="add_platform_info.platform_type == 'pdd' || add_platform_info.platform_type == 'dd'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+																		  content="新客户先发送一句问候语" placement="right">
+							<span>问候语(❔):</span>
+						</el-tooltip></div>
+						<el-input v-model="add_platform_info.greetings"
+								  placeholder="新客户先发送一句问候语"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						 v-show="add_platform_info.platform_type == 'pdd' || add_platform_info.platform_type == 'dd'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+																		  content="新客户先发送一句问候语" placement="right">
+							<span>用户名(❔):</span>
+						</el-tooltip></div>
+						<el-input v-model="add_platform_info.username"
+								  placeholder="用于用户名密码登录,首次登录需要验证码,自行填写验证码"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						 v-show="add_platform_info.platform_type == 'pdd' || add_platform_info.platform_type == 'dd'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+																		  content="用于用户名密码登录" placement="right">
+							<span>密码(❔):</span>
+						</el-tooltip></div>
+						<el-input v-model="add_platform_info.pwd"
+								  placeholder="用于用户名密码登录"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						 v-show="add_platform_info.platform_type == 'pdd' || add_platform_info.platform_type == 'dd'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+																		  content="用于平台运行报错发送飞书群提醒,新建群机器人参考:https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot" placement="right">
+							<span>飞书提醒(❔):</span>
+						</el-tooltip></div>
+						<el-input v-model="add_platform_info.feishu_url"
+								  placeholder="输入飞书群聊webHook的URL,用于平台运行报错发送飞书提醒"></el-input>
+					</div>
+					<div class="home_right_top_item" v-show="add_platform_info.platform_type !== 'pdd' ">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="输入指定回复人的平台昵称,只回指定的人，多人用逗号隔开,拼多多不支持" placement="right">
+								<span>指定回复人(❔):</span>
+							</el-tooltip></div>
+						<el-input v-model="add_platform_info.replay_name" placeholder="不填默认回复所有人"></el-input>
+					</div>
+					<div class="home_right_top_item"
+						v-show="add_platform_info.platform_type !== 'vx' &&  add_platform_info.platform_type !== 'qn'">
+						<div class="home_right_top_item_name"><el-tooltip class="item" effect="dark"
+								content="按输入时间定时刷新页面,防止登录过期,单位是秒,填写完需要重新点击启动按钮" placement="right">
+								<span>定时刷新(秒)(❔):</span>
+							</el-tooltip></div>
+						<el-input v-model="add_platform_info.refresh_time"
+							placeholder="填写刷新秒数,不填默认3600秒刷新一次"></el-input>
+					</div>
+				</div>
+			</div>
+			<el-table :data="tableData" border style="width: 100%">
+				<el-table-column prop="id" label="编号" width="50">
+				</el-table-column>
+				<el-table-column prop="type_name" label="智能体平台" width="120">
+				</el-table-column>
+				<el-table-column prop="bot_id" label="appid/botid/url" width="120">
+				</el-table-column>
+				<el-table-column prop="token" label="秘钥">
+				</el-table-column>
+				<el-table-column fixed="right" label="操作" width="100">
+					<template slot-scope="scope">
+						<el-button type="text" size="small" @click="addAgentItem(scope.row)">添加智能体</el-button>
+					</template>
+				</el-table-column>
+			</el-table>
+			<div style="width:100%;display: flex;justify-content: flex-end;margin-top: 10px">
+				<el-button type="primary" @click="clickAddPlatform">{{add_flag?"添加平台":"修改平台"}}</el-button>
+			</div>
+
+		</el-dialog>
+
+		<!--	设置token	-->
+		<el-dialog title="智能体平台" :visible.sync="dialogVisible" :close-on-click-modal="false" width="80%" top="1vh">
+			<div>
+				<div class="dialog_item">
+					<div>选择对接平台:</div>
+					<el-select v-model="chose_type" placeholder="请选择对接平台">
+						<el-option v-for="item in chose_source" :key="item.id" :label="item.name" :value="item.id">
+						</el-option>
+					</el-select>
+					<el-button type="primary" @click="clickConfirmSet">添加</el-button>
+				</div>
+				<div class="dialog_item" v-show="chose_type==0">
+					<el-input v-model="coze_bot_id" placeholder="请输入扣子的bot-id"></el-input>
+				</div>
+				<div class="dialog_item" v-show="chose_type==0">
+					<el-input v-model="coze_token" placeholder="请输入扣子的token"></el-input>
+				</div>
+				<div class="dialog_item" v-show="chose_type==1">
+					<el-input v-model="bailian_app_id" placeholder="请输入百炼的appid"></el-input>
+				</div>
+				<div class="dialog_item" v-show="chose_type==1">
+					<el-input v-model="bailian_key" placeholder="请输入百炼的key"></el-input>
+				</div>
+				<div class="dialog_item" v-show="chose_type==2">
+					<el-input v-model="fastgpt_url" placeholder="请输入fastgpt的url"></el-input>
+				</div>
+				<div class="dialog_item" v-show="chose_type==2">
+					<el-input v-model="fastgpt_token" placeholder="请输入fastgpt的token"></el-input>
+				</div>
+
+			</div>
+			<el-table :data="tableData" border style="width: 100%">
+				<el-table-column prop="id" label="编号" width="50">
+				</el-table-column>
+				<el-table-column prop="type_name" label="智能体平台" width="120">
+				</el-table-column>
+				<el-table-column prop="bot_id" label="appid/botid/url" width="120">
+				</el-table-column>
+				<el-table-column prop="token" label="秘钥">
+				</el-table-column>
+				<el-table-column fixed="right" label="操作" width="100">
+					<template slot-scope="scope">
+						<el-button type="text" size="small" @click="deleteTokenItem(scope.row)">删除</el-button>
+					</template>
+				</el-table-column>
+			</el-table>
+		</el-dialog>
+		<!-- 用户登录 -->
+		<el-dialog title="用户登录" :visible.sync="dialogVisibleLogin" :close-on-click-modal="false"  :show-close="false" width="80%" top="1vh">
+			<div>
+				<div class="dialog_item">
+					<div style="width: 100px;">用户名:</div>
+					<el-input v-model="user.username" placeholder="请输入用户名"></el-input>
+				</div>
+				<div class="dialog_item">
+					<div style="width: 100px;">密码:</div>
+					<el-input v-model="user.password" type="password" placeholder="请输入密码"></el-input>
+				</div>
+				<div class="dialog_item" style="justify-content: center;">
+					<el-button type="primary" @click="login">登录</el-button>
+				</div>
+			</div>
+		</el-dialog>
+		 <!-- end 用户登录 -->
+	</div>
+</body>
+<script>
+	// debugger 显示控制台
+	if (new Service().isDebug) {
+		new VConsole()
+	}
+	var vm = new Vue({
+		el: '#app',
+		data: {
+			user: {username:'',password:''},
+			dialogVisibleLogin:false,
+			//新增或者修改平台
+			add_flag:true,
+			msg_count:0,
+			all_platforms:[],
+			add_platform_info: {
+				id:'',
+				alias_name: '',
+				platform_type: '',
+				platform_name: '',
+				checked_greetings:false,
+				greetings:'',
+				checked_feishu:false,
+				feishu_url:'',
+				checked_pwd_login:false,
+				username:'',
+				pwd:'',
+				refresh_time: 3600,
+				transfer_name: '',
+				transfer_keyword: '',
+				replay_name: '',
+				token_id: '',
+				token: '',
+				bot_id: '',
+				connect_type_id: '',
+				token_type_name: '',
+			},
+			current_single_platform:{},
+			tableData: [],
+			dialogVisibleAddPlatform: false,
+			dialogVisible: false,
+			coze_bot_id: '',
+			coze_token: '',
+			bailian_key: '',
+			bailian_app_id: '',
+			fastgpt_token: '',
+			fastgpt_url: '',
+			chose_type: 0,
+			chose_source: [
+				{ id: 0, name: '扣子' },
+				{ id: 1, name: '阿里百炼' },
+			],
+			// 页面跳转参数堆栈 先进后出
+			pageParaStack: [],
+			stepPage: 'home',
+			is_start: false,
+			is_human: false,
+			chatMsg: '',
+		},
+		mounted: function () {
+			// 将python_call_js方法绑定到window下面，提供给python外部调用
+			let that = this;
+			window['py_set_platform_status'] = that.py_set_platform_status;
+			window['py_add_msg'] = that.py_add_msg;
+			setTimeout(function () {
+				// if (window.bridge && typeof window.bridge.js_get_user === 'function') {
+				// 	window.bridge.js_get_user(function (data) {
+				// 		userInfo = JSON.parse(data)
+				// 		if(userInfo.code=='success'){
+				// 			that.dialogVisibleLogin = false;
+				// 		}else{
+				// 			that.dialogVisibleLogin = true;
+				// 			that.user={username:'',password:''}
+				// 			setTimeout(() => {
+				// 				that.$message({ showClose: true, message: userInfo.message, type:'error' });
+				// 			}, 100);
+				// 		}
+				// 	});
+				// } else {
+				// 	console.error('Bridge or method not found');
+				// }
+				if (window.bridge && typeof window.bridge.js_get_platform === 'function') {
+					window.bridge.js_get_platform(function (platforms) {
+						// that.all_platforms = JSON.parse(platforms);
+						that.setAllPlatformStatus(JSON.parse(platforms))
+						// console.log(that.all_platforms)
+					});
+				} else {
+					console.error('Bridge or method not found');
+				}
+				if (window.bridge && typeof window.bridge.js_get_all_token === 'function') {
+					window.bridge.js_get_all_token(function (configInfoJson) {
+						that.tableData = JSON.parse(configInfoJson);
+					});
+				} else {
+					console.error('Bridge or method not found');
+				}
+			}, 500);
+		},
+		methods: {
+			handleCheckedFeishuChange() {
+				let that = this;
+				let para = {
+					type:'feishu',
+					id:this.current_single_platform.id,
+					checked_feishu:this.current_single_platform.checked_feishu?1:0
+				}
+				window.bridge.js_update_greetings_or_loginpwd(JSON.stringify(para), function (data) {
+					if (data == 'success') {
+						if (that.current_single_platform.checked_feishu) {
+							that.$message.success('已启用飞书提醒');
+						} else {
+							that.$message.warning('已禁用飞书提醒');
+						}
+					} else {
+						that.$message({ showClose: true, message: '修改失败', type: 'error' });
+					}
+				});
+
+			},
+			handleCheckedGreetingsChange() {
+				let that = this;
+				let para = {
+					type:'greetings',
+					id:this.current_single_platform.id,
+					checked_greetings:this.current_single_platform.checked_greetings?1:0
+				}
+				window.bridge.js_update_greetings_or_loginpwd(JSON.stringify(para), function (data) {
+					if (data == 'success') {
+						if (that.current_single_platform.checked_greetings) {
+							that.$message.success('已启用问候语');
+						} else {
+							that.$message.warning('已禁用问候语');
+						}
+					} else {
+						that.$message({ showClose: true, message: '修改失败', type: 'error' });
+					}
+				});
+
+			},
+			handleCheckedPwdLoginChange() {
+				let that = this;
+				let para = {
+					type:'pwd_login',
+					id:this.current_single_platform.id,
+					checked_pwd_login:this.current_single_platform.checked_pwd_login?1:0
+				}
+				window.bridge.js_update_greetings_or_loginpwd(JSON.stringify(para), function (data) {
+					if (data == 'success') {
+						if (that.current_single_platform.checked_pwd_login) {
+							that.$message.success('已启用密码登录');
+						} else {
+							that.$message.warning('已禁用密码登录');
+						}
+					} else {
+						that.$message({ showClose: true, message: '修改失败', type: 'error' });
+					}
+				});
+
+			},
+			// 登录
+			login(){
+				let that = this;
+				// 确认用户名和密码是否为空
+				if (!this.user.username || !this.user.password) {
+					this.$message({ showClose: true, message: '用户名和密码不能为空', type: 'error' });
+					return;
+				}
+				// 调用python登录方法
+				window.bridge.js_login(JSON.stringify(this.user), function (data) {
+					userInfo = JSON.parse(data)
+					if(userInfo.code=='success'){
+						that.$message({ showClose: true, message: '登录成功', type: 'success' });
+						that.dialogVisibleLogin = false;
+					}else{
+						that.dialogVisibleLogin = true;
+						that.$message({ showClose: true, message: userInfo.message, type:'error' });
+					}
+				})
+			},
+			//遍历平台信息 加入默认未启动 如果启动了加入启动状态
+			setAllPlatformStatus(platforms){
+				let that = this;
+				for(let i=0;i< platforms.length;i++){
+					item_i = platforms[i];
+					item_i.status = false;
+					for(let j=0;j<this.all_platforms.length;j++){
+						item_j= this.all_platforms[j];
+						if(item_i.id===item_j.id && "status" in item_j){
+							item_i.status = item_j.status;
+							break;
+						}
+					}
+				}
+				that.all_platforms = platforms;
+			},
+			//更改已经添加的平台
+			updatePlatform(){
+				let that = this;
+				if(this.current_single_platform.status){
+					that.$message({ showClose: true, message: '请先停止再修改', type: 'error' });
+					return
+				}
+				this.dialogVisibleAddPlatform = true;
+				this.add_flag = false;
+				console.log('=====this.current_single_platform=========')
+				console.log(this.current_single_platform)
+				this.add_platform_info = {
+					id:this.current_single_platform.id,
+					alias_name: this.current_single_platform.alias_name,
+					platform_type: this.current_single_platform.platform_type,
+					platform_name: this.current_single_platform.platform_name,
+					greetings:this.current_single_platform.greetings,
+					feishu_url:this.current_single_platform.feishu_url,
+					username:this.current_single_platform.username,
+					pwd:this.current_single_platform.pwd,
+					refresh_time: this.current_single_platform.refresh_interval,
+					transfer_name: this.current_single_platform.transfrom_name,
+					transfer_keyword: this.current_single_platform.transfrom_keywork,
+					replay_name: this.current_single_platform.designated_person,
+					token_id: this.current_single_platform.token_id,
+					token: this.current_single_platform.token,
+					bot_id: this.current_single_platform.bot_id,
+					connect_type_id: this.current_single_platform.connect_type_id,
+					token_type_name: this.chose_source.find(item => item.id === this.current_single_platform.connect_type_id)?.name,
+				}
+			},
+			//重置
+			resetPlatformInfo(){
+				this.add_platform_info = {
+					id:'',
+					alias_name: '',
+					platform_type: '',
+					checked_greetings:false,
+					greetings:'',
+					checked_pwd_login:false,
+					username:'',
+					pwd:'',
+					checked_feishu:false,
+					feishu_url:'',
+					platform_name: '',
+					refresh_time: 3600,
+					transfer_name: '',
+					transfer_keyword: '',
+					replay_name: '',
+					token_id: '',
+					token: '',
+					bot_id: '',
+					connect_type_id: '',
+					token_type_name: '',
+				}
+			},
+			// 点击当个平台
+			clickSinglePlatform(item){
+					this.current_single_platform = item;
+					console.log(this.current_single_platform)
+			},
+			// 删除平台
+			deletePlatformItem(item){
+				let that = this;
+				if(item.status){
+					that.$message({ showClose: true, message: '请先停止再删除', type: 'error' });
+					return
+				}
+				let file_path = 'state_'+item.platform_type+'-'+item.id+'.json';
+				this.$confirm('此操作将永久删除该, 是否继续?', '提示', {
+					confirmButtonText: '确定',
+					cancelButtonText: '取消',
+					type: 'warning'
+					}).then(() => {
+					window.bridge.js_delete_platform(item.id,file_path, function (data) {
+						if (data == 'success') {
+							that.$message({
+								showClose: true,
+								message: '删除成功',
+								type: 'success'
+							});
+							if (window.bridge && typeof window.bridge.js_get_platform === 'function') {
+								window.bridge.js_get_platform(function (platforms) {
+									// that.all_platforms = JSON.parse(platforms);
+									that.setAllPlatformStatus(JSON.parse(platforms))
+									console.log(that.all_platforms)
+								});
+							} else {
+								console.error('Bridge or method not found');
+							}
+							that.current_single_platform = {};
+						} else {
+							that.$message({ showClose: true, message: '添加失败', type: 'error' });
+						}
+					});
+
+					}).catch(() => {
+					this.$message({
+						type: 'info',
+						message: '已取消删除'
+					});          
+					});				
+			},
+			//添加平台
+			clickAddPlatform() {
+				let that = this;
+				let is_have_wechat = false;
+				let is_have_qianniu = false;
+				if(!this.add_platform_info.platform_name){
+					this.$message({ showClose: true, message: '请选择添加平台', type: 'error' });
+					return
+				}
+				if(!this.add_platform_info.alias_name){
+					this.$message({ showClose: true, message: '请添写别名', type: 'error' });
+					return
+				}
+				if(!this.add_platform_info.token){
+					this.$message({ showClose: true, message: '请添加智能体', type: 'error' });
+					return
+				}
+				if (this.add_platform_info.transfer_name && !this.add_platform_info.transfer_keyword || !this.add_platform_info.transfer_name && this.add_platform_info.transfer_keyword) {
+					this.$message({showClose: true,message: '填写转交人必须填写转交关键词',type: 'error'});
+					return
+				}
+				for (let i = 0; i < this.all_platforms.length; i++) {
+					if (this.all_platforms[i].platform_type === "vx" ) {
+						is_have_wechat = true;
+					}
+					if (this.all_platforms[i].platform_type === "qn") {
+						is_have_qianniu = true;
+					}
+				}
+				if(this.add_platform_info.platform_type === "vx" &&is_have_wechat && this.add_flag){
+					this.$message({ showClose: true, message: '已经添加过微信，微信只能单开', type: 'error' });
+					return
+				}
+				if(this.add_platform_info.platform_type === "qn" &&is_have_qianniu && this.add_flag){
+					this.$message({ showClose: true, message: '已经添加过千牛，千牛只能单开', type: 'error' });
+					return
+				}
+				if(this.add_flag){
+					window.bridge.js_add_platform(JSON.stringify(that.add_platform_info), function (data) {
+						if (data == 'success') {
+							that.$message({
+								showClose: true,
+								message: '添加成功',
+								type: 'success'
+							});
+							that.dialogVisibleAddPlatform = false;
+							if (window.bridge && typeof window.bridge.js_get_platform === 'function') {
+								window.bridge.js_get_platform(function (platforms) {
+									// that.all_platforms = JSON.parse(platforms);
+									that.setAllPlatformStatus(JSON.parse(platforms))
+									// console.log(that.all_platforms)
+									that.resetPlatformInfo()
+								});
+							} else {
+								console.error('Bridge or method not found');
+							}
+						} else {
+							that.$message({ showClose: true, message: '添加失败', type: 'error' });
+						}
+					});
+				}else{
+					window.bridge.js_update_platform(JSON.stringify(that.add_platform_info), function (data) {
+						if (data == 'success') {
+							that.$message({
+								showClose: true,
+								message: '修改成功',
+								type: 'success'
+							});
+							that.dialogVisibleAddPlatform = false;
+							if (window.bridge && typeof window.bridge.js_get_platform === 'function') {
+								window.bridge.js_get_platform(function (platforms) {
+									// that.all_platforms = JSON.parse(platforms);
+									that.setAllPlatformStatus(JSON.parse(platforms))
+									console.log(that.all_platforms)
+									that.current_single_platform = that.all_platforms.find(item => item.id === that.current_single_platform.id);
+									that.resetPlatformInfo()
+								});
+							} else {
+								console.error('Bridge or method not found');
+							}
+						} else {
+							that.$message({ showClose: true, message: '修改失败', type: 'error' });
+						}
+					});
+				}
+
+			},
+			//添加智能体到平台
+			addAgentItem(row) {
+				this.add_platform_info.token_id = row.id;
+				this.add_platform_info.token = row.token;
+				this.add_platform_info.bot_id = row.bot_id;
+				this.add_platform_info.connect_type_id = row.type_id;
+				this.add_platform_info.token_type_name = row.type_name;
+			},
+			//删除平台的智能体
+			deleteAgentToken(){
+				this.add_platform_info.token_id ='';
+				this.add_platform_info.token = '';
+				this.add_platform_info.bot_id = '';
+				this.add_platform_info.connect_type_id = '';
+				this.add_platform_info.token_type_name = '';
+			},
+			deleteTokenItem(row) {
+				let that = this;
+				let id = row.id
+				window.bridge.js_delete_token(id, function (data) {
+					if (data == 'success') {
+						that.$message({
+							showClose: true,
+							message: '删除成功',
+							type: 'success'
+						});
+						if (window.bridge && typeof window.bridge.js_get_all_token === 'function') {
+							window.bridge.js_get_all_token(function (configInfoJson) {
+								that.tableData = JSON.parse(configInfoJson);
+							});
+						} else {
+							console.error('Bridge or method not found');
+						}
+					} else {
+						this.$message({ showClose: true, message: '删除失败', type: 'error' });
+					}
+				});
+			},
+			// 确认对接平台
+			clickConfirmSet() {
+				let that = this;
+				let token = '';
+				let bot_id = '';
+				let name = ''
+				//扣子
+				if (that.chose_type === 0) {
+					if (!that.coze_token || !that.coze_bot_id) {
+						this.$message({ showClose: true, message: '请填写完参数', type: 'error' });
+						return
+					}
+					token = that.coze_token;
+					bot_id = that.coze_bot_id;
+					name = '扣子'
+				} else if (that.chose_type === 1) {
+					//百炼
+					if (!that.bailian_key || !that.bailian_app_id) {
+						this.$message({ showClose: true, message: '请填写完参数', type: 'error' });
+						return
+					}
+					token = that.bailian_key;
+					bot_id = that.bailian_app_id;
+					name = '百炼'
+				} else if (that.chose_type === 2) {
+					//fastgpt
+					if (!that.fastgpt_token || !that.fastgpt_url) {
+						this.$message({ showClose: true, message: '请填写完参数', type: 'error' });
+						return
+					}
+					token = that.fastgpt_token;
+					bot_id = that.fastgpt_url;
+					name = 'fastgpt'
+				}
+				window.bridge.js_add_token(JSON.stringify({
+					token: token,
+					bot_id: bot_id,
+					type_id: that.chose_type,
+					type_name: name
+				}), function (data) {
+					if (data == 'success') {
+						that.$message({
+							showClose: true,
+							message: '设置成功',
+							type: 'success'
+						});
+						if (window.bridge && typeof window.bridge.js_get_all_token === 'function') {
+							window.bridge.js_get_all_token(function (configInfoJson) {
+								that.tableData = JSON.parse(configInfoJson);
+							});
+						} else {
+							console.error('Bridge or method not found');
+						}
+					} else {
+						this.$message({ showClose: true, message: '添加失败', type: 'error' });
+					}
+				});
+			},
+			clickSet() {
+				let that = this;
+				this.dialogVisible = true;
+			},
+			addPlatform() {
+				this.resetPlatformInfo();
+				this.add_flag = true;
+				this.dialogVisibleAddPlatform = true;
+			},
+			py_set_platform_status(id) {
+				console.log(id)
+				for(let j=0;j<this.all_platforms.length;j++){
+					item_j= this.all_platforms[j];
+					if(item_j.id===id){
+						item_j.status = false;
+						break;
+					}
+				}
+			},
+			py_add_msg(msg) {
+				this.msg_count++
+				if(this.msg_count>300){
+					this.msg_count = 0;
+					this.chatMsg ='清空日志'+ '<br>';
+					this.$nextTick(() => {
+						this.scrollToBottom();
+					});
+				}
+				msg = this.getNowTime() + '>>' + msg;
+				this.chatMsg = this.chatMsg + msg + '<br>';
+				// 使用 nextTick 确保 DOM 已更新
+				this.$nextTick(() => {
+					this.scrollToBottom();
+				});
+			},
+			scrollToBottom() {
+				this.$refs.messages.scrollTop = this.$refs.messages.scrollHeight;
+			},
+			// 转人工
+			transferType() {
+				// if(!this.is_start){
+				// if(!this.is_start){
+				// 	this.$message.error('请先启动');
+				// 	return;
+				// }
+				if (this.is_human) {
+					this.is_human = false;
+				} else {
+					this.is_human = true;
+				}
+				window.bridge.js_transfer_type(this.is_human);
+			},
+			// 启动
+			startPlatformService(item) {
+				let that = this;
+				// console.log('=======all_platforms=========')
+				// console.log(that.all_platforms)
+				// console.log('=======item=========')
+				// console.log(item)
+				if (item.status) {
+					item.status = false;
+					window.bridge.js_stop_platform(item.id);
+				} else {
+					item.status = true;
+					window.bridge.js_start_platform(item.id);
+				}
+				this.current_single_platform = item;
+			},
+			// 选择平台
+			clickPlatform(platform, name) {
+				this.resetPlatformInfo()
+				//修改时候不重置id
+				this.add_platform_info.id=this.add_flag?'':this.current_single_platform.id;
+				this.add_platform_info.platform_name = name;
+				this.add_platform_info.platform_type = platform;
+			},
+			// 公共事件=========================================================
+			// 跳转页面
+			change_page(url) {
+				this.stepPage = url;
+			},
+			// 带参数跳转页面
+			change_page_with_para(url, para) {
+				this.stepPage = url;
+				this.pageParaStack.push(para);
+			},
+			// 取参数
+			get_para_from_page() {
+				return this.pageParaStack.pop();
+			},
+			// 获取时间
+			getNowTime() {
+				var date = new Date();
+				var M = (date.getMonth() + 1 < 10 ? '0' + (date.getMonth() + 1) : date.getMonth() + 1) + '-';
+				var D = date.getDate() < 10 ? '0' + date.getDate() + ' ' : date.getDate() + ' ';
+				var h = date.getHours() < 10 ? '0' + date.getHours() + ':' : date.getHours() + ':';
+				var m = date.getMinutes() < 10 ? '0' + date.getMinutes() + ':' : date.getMinutes() + ':';
+				var s = date.getSeconds() < 10 ? '0' + date.getSeconds() : date.getSeconds(); // 秒钟部分
+				return M + D + h + m + s;
+			},
+
+		},
+		beforeDestroy() {
+		}
+	})
+
+	document.addEventListener("DOMContentLoaded", function () {
+		new QWebChannel(qt.webChannelTransport, function (channel) {
+			window.bridge = channel.objects.pythonBridge;
+			console.log("QWebChannel initialized"); // 调试信息
+		});
+		// 当初始的 HTML 文档被完全加载和解析完成之后，DOMContentLoaded 事件被触发。
+		// 这样我们就新建一个QWebChannel对象（针对qwebchannel.js里的）。
+		// Web页面可以通过channel.objects属性访问所有已发布的对象，这里对象的id是“conn_shared”。
+		// 我们将其设置成JavaScript的全局变量：window.connection。	
+	});
+
+</script>
+
+</html>
