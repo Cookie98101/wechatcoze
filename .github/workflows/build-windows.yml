@@ -23,9 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://npmmirror.com/mirrors/playwright"
           $env:PLAYWRIGHT_BROWSERS_PATH = "0"
+          # Try mirror first; if mirror lacks this revision, fallback to official CDN.
+          $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://npmmirror.com/mirrors/playwright"
           python -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) {
+            Remove-Item Env:PLAYWRIGHT_DOWNLOAD_HOST -ErrorAction SilentlyContinue
+            python -m playwright install chromium
+          }
 
       - name: Prepare playwright browser folder for PyInstaller
         shell: pwsh
