@@ -399,22 +399,45 @@ class DouDian():
             self.sendBtnMsg(msg)
 
     def sendBtnMsg(self,msg):
-        # 使用更具体的选择器找到<footer>下的<textarea>
-        # 使用链式选择器方法，从外层逐步向内层查找
-        textarea = self.page.query_selector("[data-qa-id='qa-send-message-textarea']")
-        if textarea:
-            # 输入msg
-            textarea.fill(msg)
-        else:
-            raise Exception("输入框未找到.")
-        time.sleep(random.uniform(1, 2))
-        # 找到发送按钮并点击
-        # 查找并点击发送按钮
-        send_button = self.page.query_selector("[data-qa-id='qa-send-message-button']")
-        if send_button:
-            send_button.click()
-        else:
-            raise Exception("发送按钮未找到.")
+        chunks = self._split_text_chunks(msg)
+        for chunk in chunks:
+            textarea = self.page.query_selector("[data-qa-id='qa-send-message-textarea']")
+            if textarea:
+                textarea.fill(chunk)
+            else:
+                raise Exception("输入框未找到.")
+            time.sleep(random.uniform(0.6, 1.2))
+            send_button = self.page.query_selector("[data-qa-id='qa-send-message-button']")
+            if send_button:
+                send_button.click()
+            else:
+                raise Exception("发送按钮未找到.")
+            time.sleep(random.uniform(0.2, 0.5))
+
+    def _split_text_chunks(self, msg, max_len=400):
+        text = (msg or '').strip()
+        if not text:
+            return []
+        if len(text) <= max_len:
+            return [text]
+        chunks = []
+        buf = ''
+        split_chars = set('。！？!?；;，,\n')
+        for ch in text:
+            buf += ch
+            if len(buf) >= max_len:
+                cut = -1
+                for i in range(len(buf) - 1, int(max_len * 0.6), -1):
+                    if buf[i] in split_chars:
+                        cut = i + 1
+                        break
+                if cut == -1:
+                    cut = max_len
+                chunks.append(buf[:cut].strip())
+                buf = buf[cut:]
+        if buf.strip():
+            chunks.append(buf.strip())
+        return [c for c in chunks if c]
 
     def _switch_to_chat(self, chat_name):
         if not chat_name:
@@ -500,7 +523,7 @@ class DouDian():
         all_msgs = self._getAllCurrentMsg()
         my_msgs = all_msgs['my_messages']
         friend_msgs =  all_msgs['customer_messages']
-        chat_key = self._getCurrentUserName() or 'session'
+        chat_key = self._get_chat_cache_key()
         if config_checked_greetings==1 and config_greetings:
             greeting_key = self._get_greeting_key()
             if self._should_send_greeting(greeting_key, my_msgs, config_greetings):
@@ -534,8 +557,7 @@ class DouDian():
         return contents
 
     def _get_greeting_key(self):
-        name = self._getCurrentUserName()
-        return name if name else 'session'
+        return self._get_chat_cache_key()
 
     def _should_send_greeting(self, key, my_msgs, greetings):
         now = time.time()
@@ -941,11 +963,65 @@ class DouDian():
         # 等待页面加载完成并找到包含用户昵称的元素
         user_nickname_element = self.page.query_selector('._aTiznnWtrpmuI8BajvY')
         user_nickname = ''
-        if user_nickname_element:
-            user_nickname = user_nickname_element.text_content().strip()
-            # print(f"用户昵称: {user_nickname}")
+        selector_candidates = [
+            '._aTiznnWtrpmuI8BajvY',
+            '[data-qa-id="qa-conversation-chat-user-name"]',
+            '[data-qa-id="qa-conversation-user-name"]',
+            '.chat-info-user-name',
+        ]
+        for selector in selector_candidates:
+            try:
+                user_nickname_element = self.page.query_selector(selector)
+                if not user_nickname_element:
+                    continue
+                text = (user_nickname_element.text_content() or '').strip()
+                if text:
+                    user_nickname = re.sub(r"\s+", " ", text)
+                    break
+            except Exception:
+                continue
 
         return user_nickname
+
+    def get_current_session_key(self):
+        username = self._getCurrentUserName()
+        try:
+            key = self.page.evaluate(
+                """(name) => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const items = Array.from(document.querySelectorAll('[data-kora="conversation"][data-qa-id="qa-conversation-chat-item"]'));
+                    if (!items.length) return '';
+                    let active = items.find((el) => (el.getAttribute('aria-selected') || '') === 'true');
+                    if (!active) {
+                        active = items.find((el) => /active|selected/i.test(el.className || ''));
+                    }
+                    if (!active && name) {
+                        active = items.find((el) => norm(el.innerText).includes(name));
+                    }
+                    if (!active) return '';
+                    const attrs = ['data-conversation-id', 'data-session-id', 'data-id', 'data-user-id', 'id'];
+                    for (const attr of attrs) {
+                        const val = active.getAttribute(attr);
+                        if (val) return `${attr}:${val}`;
+                    }
+                    const text = norm(active.innerText);
+                    return text ? `text:${text.slice(0, 80)}` : '';
+                }""",
+                username or '',
+            )
+            if key:
+                return f"conv::{key}"
+        except Exception:
+            pass
+        if username:
+            return f"name::{username}"
+        return ''
+
+    def _get_chat_cache_key(self):
+        session_key = self.get_current_session_key()
+        if session_key:
+            return session_key
+        return 'session'
 
 
     def _getAllCurrentMsg(self):
@@ -1112,7 +1188,7 @@ class DouDian():
         all_msgs = self._getAllCurrentMsg()
         friend_messages = all_msgs['customer_messages']
         my_messages = all_msgs['my_messages']
-        chat_key = self._getCurrentUserName() or 'session'
+        chat_key = self._get_chat_cache_key()
         print(friend_messages)
         if not friend_messages:
             return  new_messages

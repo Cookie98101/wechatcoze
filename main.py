@@ -18,6 +18,7 @@ from PyQt5.QtGui import QIcon
 import time
 import random
 import re
+import queue
 from llm.cozeUtil import CozeUtil
 from llm.bailianUtil import BalianUtil
 from configUtil import *
@@ -551,6 +552,7 @@ class MainWindow(QMainWindow):
             last_user_msg_signature = {}
             processed_transfer_signatures = set()
             product_only_wait_seconds = 30
+            duplicate_text_cooldown_seconds = 3
             product_markers = [
                 '咨询商品:',
                 '我要咨询商品名称:',
@@ -560,22 +562,6 @@ class MainWindow(QMainWindow):
                 '商品ID:',
                 '价格:',
             ]
-            product_questions = [
-                '什么商品',
-                '看什么商品',
-                '在看什么商品',
-                '看在什么商品',
-                '多少钱',
-                '价格',
-                '多钱',
-            ]
-            id_questions = [
-                'id',
-                'ID',
-                '商品id',
-                '商品ID',
-            ]
-
             def extract_product_id(text):
                 if not text:
                     return ''
@@ -589,7 +575,162 @@ class MainWindow(QMainWindow):
                 if m:
                     return m.group(1)
                 return ''
+
+            def extract_product_title(text):
+                if not text:
+                    return ''
+                for pattern in [
+                    r'我要咨询商品名称[:：]\s*([^,\n|]+)',
+                    r'商品标题[:：]\s*([^,\n|]+)',
+                    r'咨询商品[:：]\s*([^,\n|]+)',
+                    r'我浏览了商品[:：]\s*([^,\n|]+)',
+                ]:
+                    m = re.search(pattern, text)
+                    if m:
+                        title = m.group(1).strip()
+                        title = re.sub(r'^用户正在查看商品[，,]?', '', title).strip()
+                        title = re.sub(r'^来自电商小助手的推荐', '', title).strip()
+                        title = re.sub(r'已售\s*\d+(?:\.\d+)?\s*(?:件|单|笔)?$', '', title).strip()
+                        return title
+                return ''
+
+            id_question_patterns = [
+                r'商品\s*id',
+                r'商品编号',
+                r'\bid\b',
+            ]
+
+            def update_product_context(cache_key, event, is_primary_source):
+                prev = product_cache.get(cache_key) or {}
+                version = int(prev.get('version', 0)) + 1
+                product_cache[cache_key] = {
+                    "ts": time.time(),
+                    "text": event.get("text", ""),
+                    "source": event.get("source", "text"),
+                    "product_id": event.get("product_id", ""),
+                    "version": version,
+                    "locked_primary": bool(is_primary_source),
+                }
+                return product_cache[cache_key]
+
+            def format_session_for_log(session_key):
+                if not session_key:
+                    return "-"
+                return session_key if len(session_key) <= 64 else session_key[:64] + "..."
+
+            def normalize_reply_text(raw_reply):
+                reply = (raw_reply or '').replace('#转交#', '').strip()
+                if any(m in reply for m in product_markers):
+                    for prompt in [
+                        '请您提供要咨询的商品链接哦。',
+                        '请您提供要咨询的商品链接哦',
+                        '请提供要咨询的商品链接哦。',
+                        '请提供要咨询的商品链接哦',
+                        '请您提供要咨询的商品链接。',
+                        '请您提供要咨询的商品链接',
+                        '请提供要咨询的商品链接。',
+                        '请提供要咨询的商品链接',
+                    ]:
+                        reply = reply.replace(prompt, '').strip()
+                reply = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', reply)
+                reply = re.sub(r'\\s{2,}', ' ', reply).strip()
+                if not reply:
+                    reply = '好的，已收到您的消息。'
+                return reply + '  ' + random.choice(random_reply_word) + random.choice(random_reply_character)
+
+            llm_request_queue = queue.Queue()
+            llm_result_queue = queue.Queue()
+            llm_inflight_sessions = set()
+            llm_pending_by_session = {}
+
+            def llm_worker():
+                while not stop_event.is_set():
+                    try:
+                        task = llm_request_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if task is None:
+                        llm_request_queue.task_done()
+                        break
+                    session = task.get('session_key', '')
+                    try:
+                        holder = {}
+
+                        def _worker_handler(reply, js_reply):
+                            holder['reply'] = reply
+                            holder['js_reply'] = js_reply
+
+                        if config_chose_type == 0:
+                            coze_util.send_message_and_poll(task['llm_user_key'], task['receive_msg'], _worker_handler)
+                        elif config_chose_type == 1:
+                            bailian_util.send_message_and_poll(task['llm_user_key'], task['receive_msg'], _worker_handler)
+                        elif config_chose_type == 2:
+                            fast_util.send_chat_completion(task['llm_user_key'], task['receive_msg'], _worker_handler)
+                        else:
+                            raise Exception("未配置有效模型类型")
+
+                        if not holder.get('js_reply'):
+                            holder['js_reply'] = '回复消息::(空回复)'
+                        llm_result_queue.put({
+                            'session_key': session,
+                            'chat_name': task.get('chat_name', ''),
+                            'reply': holder.get('reply', ''),
+                            'js_reply': holder.get('js_reply', ''),
+                            'error': '',
+                        })
+                    except Exception as e:
+                        llm_result_queue.put({
+                            'session_key': session,
+                            'chat_name': task.get('chat_name', ''),
+                            'reply': '',
+                            'js_reply': '',
+                            'error': str(e),
+                        })
+                    finally:
+                        llm_request_queue.task_done()
+
+            llm_worker_thread = threading.Thread(target=llm_worker, daemon=True)
+            llm_worker_thread.start()
+
             while not stop_event.is_set():  # 如果设置了停止事件，则退出循环
+                while True:
+                    try:
+                        result = llm_result_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    done_session = result.get('session_key', '')
+                    if done_session:
+                        llm_inflight_sessions.discard(done_session)
+                    err_text = result.get('error', '')
+                    if err_text:
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|'+err_text[:50])});")
+                    else:
+                        try:
+                            final_reply = normalize_reply_text(result.get('reply', ''))
+                            target_chat = result.get('chat_name', '')
+                            if target_chat:
+                                sent_ok = dd.sendMsgToChat(target_chat, final_reply, switch_back=True)
+                                if not sent_ok:
+                                    dd.sendMsg(final_reply)
+                            else:
+                                dd.sendMsg(final_reply)
+                        except Exception as e:
+                            err_text = str(e)
+                            logging.error(err_text)
+                            if "图片路径不对或者没找到上传按钮" not in err_text:
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|报错:'+err_text[:50])});")
+                        js_reply = result.get('js_reply', '')
+                        if js_reply:
+                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|'+js_reply)});")
+                    if done_session:
+                        pending_tasks = llm_pending_by_session.get(done_session, [])
+                        if pending_tasks:
+                            pending_task = pending_tasks.pop(0)
+                            if not pending_tasks:
+                                llm_pending_by_session.pop(done_session, None)
+                            llm_inflight_sessions.add(done_session)
+                            llm_request_queue.put(pending_task)
+
                 msgs = []
                 current_time = time.time()
                 if current_time - last_refresh_time > config_refresh_interval:
@@ -630,8 +771,8 @@ class MainWindow(QMainWindow):
                     # 初始化一个空列表用于存储非空的文本内容
                     contents = []
                     chat_name = ''
-                    product_payloads_primary = []
-                    product_payloads_panel = []
+                    product_events_primary = []
+                    product_events_panel = []
                     user_texts = []
                     user_text_signatures = []
                     # 遍历messages列表
@@ -642,12 +783,21 @@ class MainWindow(QMainWindow):
                             if message['type'] in ('text', 'card', 'from_info') and any(m in message['content'] for m in product_markers):
                                 if '没有咨询过宝贝' not in message['content'] and '暂无咨询' not in message['content'] and '暂无商品' not in message['content']:
                                     source = message.get('source', '')
-                                    if message['type'] == 'card' or source in ('link', 'system'):
-                                        product_payloads_primary.append(message['content'])
-                                    elif source == 'panel':
-                                        product_payloads_panel.append(message['content'])
+                                    if message['type'] == 'card':
+                                        normalized_source = 'card'
+                                    elif source in ('link', 'system', 'panel'):
+                                        normalized_source = source
                                     else:
-                                        product_payloads_primary.append(message['content'])
+                                        normalized_source = 'text'
+                                    event = {
+                                        "text": message['content'],
+                                        "source": normalized_source,
+                                        "product_id": extract_product_id(message['content']),
+                                    }
+                                    if normalized_source in ('card', 'link', 'system', 'text'):
+                                        product_events_primary.append(event)
+                                    elif normalized_source == 'panel':
+                                        product_events_panel.append(event)
                             if message['type'] == 'text':
                                 user_texts.append(message['content'])
                                 user_text_signatures.append(f"{message.get('index','')}::{message['content']}")
@@ -656,48 +806,83 @@ class MainWindow(QMainWindow):
                             #未识别的消息
                             chat_name = message['who']
                             contents.append('你好')
-                    # 使用逗号拼接所有非空的内容
-                    receive_msg = ','.join(contents)
-                    user_question = ','.join(user_texts).strip()
-                    cache_key = chat_name or f"{config_platform}_default"
+                    # 原始聚合内容（仅用于解析/调试），模型输入后续会压缩为“最新问题+商品上下文”
+                    raw_receive_msg = ','.join(contents)
+                    receive_msg = raw_receive_msg
+                    user_question = user_texts[-1].strip() if user_texts else ''
+                    session_key = ''
+                    try:
+                        session_key = dd.get_current_session_key()
+                    except Exception:
+                        session_key = ''
+                    cache_key = session_key or chat_name or f"{config_platform}_default"
                     latest_user_text = user_texts[-1].strip() if user_texts else ''
                     curr_sig = " | ".join(user_text_signatures)
                     if user_texts:
-                        if last_user_msg_signature.get(cache_key) == curr_sig:
+                        now_sig_ts = time.time()
+                        prev_sig_info = last_user_msg_signature.get(cache_key)
+                        if (
+                            prev_sig_info
+                            and prev_sig_info.get("sig") == curr_sig
+                            and now_sig_ts - prev_sig_info.get("ts", 0) < duplicate_text_cooldown_seconds
+                        ):
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|检测到重复客户消息，跳过本轮')});")
                             time.sleep(wait)
                             continue
-                        last_user_msg_signature[cache_key] = curr_sig
+                        last_user_msg_signature[cache_key] = {"sig": curr_sig, "ts": now_sig_ts}
                         product_only_waiting.pop(cache_key, None)
                     # 防止“已售xx件”进入模型上下文，避免回复夹带销量信息
-                    receive_msg = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', receive_msg)
-                    receive_msg = re.sub(r'\\s{2,}', ' ', receive_msg).strip()
-                    selected_product_payloads = product_payloads_primary if product_payloads_primary else product_payloads_panel
-                    if selected_product_payloads:
-                        product_cache[cache_key] = {
-                            "ts": time.time(),
-                            "text": " | ".join(selected_product_payloads),
-                        }
-                    elif any(m in receive_msg for m in product_markers):
-                        if '没有咨询过宝贝' in receive_msg or '暂无咨询' in receive_msg or '暂无商品' in receive_msg:
+                    raw_receive_msg = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', raw_receive_msg)
+                    raw_receive_msg = re.sub(r'\\s{2,}', ' ', raw_receive_msg).strip()
+                    receive_msg = raw_receive_msg
+                    selected_primary_event = product_events_primary[-1] if product_events_primary else None
+                    selected_panel_event = product_events_panel[-1] if product_events_panel else None
+                    selected_product_event = selected_primary_event or selected_panel_event
+                    context_info = None
+                    if selected_primary_event:
+                        context_info = update_product_context(cache_key, selected_primary_event, is_primary_source=True)
+                    elif selected_panel_event:
+                        current_ctx = product_cache.get(cache_key)
+                        if not (current_ctx and current_ctx.get("locked_primary")):
+                            context_info = update_product_context(cache_key, selected_panel_event, is_primary_source=False)
+                    elif any(m in raw_receive_msg for m in product_markers):
+                        if '没有咨询过宝贝' in raw_receive_msg or '暂无咨询' in raw_receive_msg or '暂无商品' in raw_receive_msg:
                             pass
                         else:
-                            product_cache[cache_key] = {
-                                "ts": time.time(),
-                                "text": receive_msg,
-                            }
-                    if user_texts and not any(m in receive_msg for m in product_markers):
+                            current_ctx = product_cache.get(cache_key)
+                            if not (current_ctx and current_ctx.get("locked_primary")):
+                                fallback_event = {
+                                    "text": raw_receive_msg,
+                                    "source": "text",
+                                    "product_id": extract_product_id(raw_receive_msg),
+                                }
+                                context_info = update_product_context(cache_key, fallback_event, is_primary_source=False)
+                    if context_info:
+                        self.updateWebView.emit(
+                            f"py_add_msg({json.dumps(config_name + '|商品上下文更新 session=' + format_session_for_log(cache_key) + ' source=' + context_info.get('source', '-') + ' id=' + (context_info.get('product_id', '-') or '-') + ' v=' + str(context_info.get('version', 1)))});"
+                        )
+                    if user_texts and not any(m in raw_receive_msg for m in product_markers):
                         cached = product_cache.get(cache_key)
                         if cached and time.time() - cached["ts"] <= product_cache_ttl:
-                            receive_msg = f"{cached['text']}\n用户问题:{user_question or receive_msg}"
-                    if not user_texts and selected_product_payloads:
-                        product_only_waiting[cache_key] = {
-                            'ts': time.time(),
-                            'chat_name': chat_name,
-                        }
-                        self.updateWebView.emit(f"py_add_msg({json.dumps('仅收到商品信息，等待用户提问')});")
-                        time.sleep(wait)
-                        continue
+                            receive_msg = f"{cached['text']}\n用户问题:{user_question or latest_user_text or raw_receive_msg}"
+                            self.updateWebView.emit(
+                                f"py_add_msg({json.dumps(config_name + '|复用商品上下文 session=' + format_session_for_log(cache_key) + ' source=' + cached.get('source', '-') + ' id=' + (cached.get('product_id', '-') or '-') + ' v=' + str(cached.get('version', 1)))});"
+                            )
+                        else:
+                            receive_msg = latest_user_text or user_question or raw_receive_msg
+                    if user_texts and any(m in raw_receive_msg for m in product_markers):
+                        if selected_product_event:
+                            receive_msg = f"{selected_product_event.get('text', raw_receive_msg)}\n用户问题:{latest_user_text or user_question or raw_receive_msg}"
+                        else:
+                            cached = product_cache.get(cache_key)
+                            if cached and time.time() - cached["ts"] <= product_cache_ttl:
+                                receive_msg = f"{cached.get('text', raw_receive_msg)}\n用户问题:{latest_user_text or user_question or raw_receive_msg}"
+                            else:
+                                receive_msg = latest_user_text or user_question or raw_receive_msg
+                    if not user_texts and selected_product_event:
+                        auto_intro = '请基于以上商品信息，先回复一句简短商品介绍，并邀请用户提问。'
+                        receive_msg = f"{selected_product_event.get('text', receive_msg)}\n用户问题:{auto_intro}"
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，已自动按商品信息回复')});")
                     if  receive_msg and designated_person and chat_name not in designated_person:
                         self.updateWebView.emit(f"py_add_msg({json.dumps('不在指定回复人中,默认不回复')});")
                         time.sleep(wait)
@@ -722,47 +907,47 @@ class MainWindow(QMainWindow):
                         time.sleep(wait)
                         continue
 
-                    self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
-                    #定义一个匿名函数（lambda）作为回调函数，包含两个逻辑
-                    def message_handler(reply,js_reply):
-                        try:
-                            # 只允许客户文本触发转交；模型里的控制词不再触发转交动作
-                            reply = reply.replace('#转交#', '').strip()
-                            if any(m in reply for m in product_markers):
-                                for prompt in [
-                                    '请您提供要咨询的商品链接哦。',
-                                    '请您提供要咨询的商品链接哦',
-                                    '请提供要咨询的商品链接哦。',
-                                    '请提供要咨询的商品链接哦',
-                                    '请您提供要咨询的商品链接。',
-                                    '请您提供要咨询的商品链接',
-                                    '请提供要咨询的商品链接。',
-                                    '请提供要咨询的商品链接',
-                                ]:
-                                    reply = reply.replace(prompt, '').strip()
-                            reply = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', reply)
-                            reply = re.sub(r'\\s{2,}', ' ', reply).strip()
-                            if not reply:
-                                reply = '好的，已收到您的消息。'
-                            reply = reply+'  '+ random.choice(random_reply_word) + random.choice(random_reply_character)
-                            dd.sendMsg(reply)
-                        except Exception as e:
-                            err_text = str(e)
-                            logging.error(err_text)
-                            if "图片路径不对或者没找到上传按钮" not in err_text:
-                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|报错:'+err_text[:50])});")
-                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|'+js_reply)});")
-                    try:
-                        # 调用 send_message_and_poll 方法并传递回调函数
-                        if config_chose_type== 0:
-                            # 调用 send_message_and_poll 方法并传递回调函数
-                            coze_util.send_message_and_poll(config_platform+'_'+chat_name, receive_msg, message_handler,)
-                        elif config_chose_type== 1:
-                            bailian_util.send_message_and_poll(config_platform+'_bl'+chat_name, receive_msg, message_handler)
-                        elif config_chose_type== 2:
-                            fast_util.send_chat_completion(config_platform+'_fast'+chat_name, receive_msg, message_handler)
-                    except Exception as e:
-                        self.updateWebView.emit(f"py_add_msg({json.dumps(str(e)[:50])});")
+                    # 商品ID类问题优先走本地确定性回复，避免模型空答/乱答
+                    if latest_user_text and any(re.search(p, latest_user_text, flags=re.IGNORECASE) for p in id_question_patterns):
+                        local_ctx = receive_msg
+                        cached = product_cache.get(cache_key)
+                        if cached and time.time() - cached["ts"] <= product_cache_ttl:
+                            local_ctx = f"{cached.get('text', '')}\n{receive_msg}"
+                        title = extract_product_title(local_ctx)
+                        if title:
+                            direct_reply = f"商品ID（商品标题）是“{title}”。"
+                        else:
+                            matched_id = extract_product_id(local_ctx)
+                            if matched_id:
+                                direct_reply = f"商品ID是{matched_id}。"
+                            else:
+                                direct_reply = "当前消息里未识别到商品标题，请再发一次商品卡片。"
+                        direct_reply = direct_reply + '  ' + random.choice(random_reply_word) + random.choice(random_reply_character)
+                        dd.sendMsg(direct_reply)
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
+                        time.sleep(wait)
+                        continue
+
+                    llm_prefix = 'coze'
+                    if config_chose_type == 1:
+                        llm_prefix = 'bailian'
+                    elif config_chose_type == 2:
+                        llm_prefix = 'fastgpt'
+                    llm_user_key = f"{config_platform}_{llm_prefix}_{cache_key}"
+                    task = {
+                        'session_key': cache_key,
+                        'chat_name': chat_name,
+                        'receive_msg': receive_msg,
+                        'llm_user_key': llm_user_key,
+                    }
+                    if cache_key in llm_inflight_sessions:
+                        pending_tasks = llm_pending_by_session.setdefault(cache_key, [])
+                        pending_tasks.append(task)
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
+                    else:
+                        llm_inflight_sessions.add(cache_key)
+                        llm_request_queue.put(task)
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
 
                 if stop_event.is_set():
                     break
@@ -795,10 +980,26 @@ class MainWindow(QMainWindow):
                     product_only_waiting.pop(key, None)
 
                 time.sleep(wait)
+            try:
+                llm_request_queue.put_nowait(None)
+            except Exception:
+                pass
+            try:
+                llm_worker_thread.join(timeout=1)
+            except Exception:
+                pass
             dd.stopLaunch()
         except Exception as e:
             print(e)
             logging.error(e)
+            try:
+                llm_request_queue.put_nowait(None)
+            except Exception:
+                pass
+            try:
+                llm_worker_thread.join(timeout=1)
+            except Exception:
+                pass
             dd.stopLaunch()
             self.updateWebView.emit(f"py_set_platform_status({json.dumps(single_platform['id'])});")
             self.updateWebView.emit(f"py_add_msg({json.dumps(single_platform['platform_name']+'-'+single_platform['alias_name']+'平台报错停止:'+str(e))});")
