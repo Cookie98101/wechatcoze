@@ -1,6 +1,7 @@
 from playwright.sync_api import sync_playwright
 import json
 import os,time,random, re
+import hashlib
 from urllib.parse import urlparse, parse_qs, unquote
 import urllib.request
 from html import unescape
@@ -24,6 +25,9 @@ class DouDian():
         self.last_panel_text = ""
         self.link_cache = {}
         self.chat_last_friend_index = {}
+        self.chat_seen_friend_counts = {}
+        self.last_user_nickname = ""
+        self.last_chat_cache_key = ""
         self.greeting_sent_at = {}
         self.greeting_cooldown_seconds = 2 * 3600
         self.checked_feishu = 0
@@ -524,6 +528,8 @@ class DouDian():
         my_msgs = all_msgs['my_messages']
         friend_msgs =  all_msgs['customer_messages']
         chat_key = self._get_chat_cache_key()
+        current_counts = self._build_message_counts(friend_msgs) if friend_msgs else {}
+        self.chat_seen_friend_counts[chat_key] = current_counts
         if config_checked_greetings==1 and config_greetings:
             greeting_key = self._get_greeting_key()
             if self._should_send_greeting(greeting_key, my_msgs, config_greetings):
@@ -561,10 +567,6 @@ class DouDian():
 
     def _should_send_greeting(self, key, my_msgs, greetings):
         now = time.time()
-        if any(msg['content'] == greetings for msg in my_msgs):
-            if key not in self.greeting_sent_at:
-                self.greeting_sent_at[key] = now
-                return False
         last = self.greeting_sent_at.get(key)
         if last is None or now - last >= self.greeting_cooldown_seconds:
             self.greeting_sent_at[key] = now
@@ -639,6 +641,9 @@ class DouDian():
                 '暂无浏览',
                 '暂无足迹',
                 '暂无记录',
+                '最近看过以下商品',
+                '消费者最近看过以下商品',
+                '详情已浏览',
             ]
             info = self._get_panel_info(
                 '#rc-tabs-1-panel-combination',
@@ -968,6 +973,9 @@ class DouDian():
             '[data-qa-id="qa-conversation-chat-user-name"]',
             '[data-qa-id="qa-conversation-user-name"]',
             '.chat-info-user-name',
+            '[class*="chat-user-name"]',
+            '[class*="conversation-user-name"]',
+            '[class*="session-user-name"]',
         ]
         for selector in selector_candidates:
             try:
@@ -981,7 +989,35 @@ class DouDian():
             except Exception:
                 continue
 
-        return user_nickname
+        # 兜底：从输入提示/顶部文案中提取当前会话昵称
+        if not user_nickname:
+            try:
+                guessed = self.page.evaluate(
+                    """() => {
+                        const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                        const body = document.body ? (document.body.innerText || '') : '';
+                        if (!body) return '';
+                        let m = body.match(/发送给\\s*([^，,\\n]{1,40})\\s*[，,]/);
+                        if (m && m[1]) return norm(m[1]);
+                        m = body.match(/发送给\\s*([^\\n]{1,40})\\s*使用Enter/);
+                        if (m && m[1]) return norm(m[1]);
+                        m = body.match(/\\n([^\\n]{1,40})\\s+添加备注/);
+                        if (m && m[1]) return norm(m[1]);
+                        return '';
+                    }"""
+                )
+                if guessed:
+                    user_nickname = re.sub(r"\s+", " ", guessed).strip()
+            except Exception:
+                pass
+
+        if user_nickname:
+            self.last_user_nickname = user_nickname
+            return user_nickname
+        return self.last_user_nickname
+
+    def getCurrentChatName(self):
+        return self._getCurrentUserName()
 
     def get_current_session_key(self):
         username = self._getCurrentUserName()
@@ -1018,10 +1054,26 @@ class DouDian():
         return ''
 
     def _get_chat_cache_key(self):
+        username = self._getCurrentUserName()
         session_key = self.get_current_session_key()
-        if session_key:
-            return session_key
-        return 'session'
+        # 会话列表文本键(conv::text:...)不稳定，优先用昵称键避免同会话抖动
+        key = ''
+        if session_key and not session_key.startswith('conv::text:'):
+            key = session_key
+        elif username:
+            key = f"name::{username}"
+        elif session_key:
+            key = session_key
+        elif self.last_chat_cache_key:
+            key = self.last_chat_cache_key
+        else:
+            key = 'session'
+        if key:
+            self.last_chat_cache_key = key
+        return key
+
+    def get_chat_cache_key(self):
+        return self._get_chat_cache_key()
 
 
     def _getAllCurrentMsg(self):
@@ -1182,6 +1234,36 @@ class DouDian():
         friend_msg = self._getAllCurrentMsg()['customer_messages']
         return friend_msg
 
+    def _message_fingerprint(self, msg):
+        base = "|".join([
+            str(msg.get('type', '')),
+            str(msg.get('source', '')),
+            str(msg.get('good_name', '')),
+            str(msg.get('content', '')).strip(),
+            str(msg.get('src', '')),
+            str(msg.get('product_link', '')),
+        ])
+        return hashlib.sha1(base.encode('utf-8', errors='ignore')).hexdigest()
+
+    def _build_message_counts(self, messages):
+        counts = {}
+        for msg in messages:
+            fp = msg.get('fingerprint') or self._message_fingerprint(msg)
+            msg['fingerprint'] = fp
+            counts[fp] = counts.get(fp, 0) + 1
+        return counts
+
+    def _diff_new_messages(self, messages, previous_counts):
+        seen_now = {}
+        new_messages = []
+        for msg in messages:
+            fp = msg.get('fingerprint') or self._message_fingerprint(msg)
+            msg['fingerprint'] = fp
+            seen_now[fp] = seen_now.get(fp, 0) + 1
+            if seen_now[fp] > previous_counts.get(fp, 0):
+                new_messages.append(msg)
+        return new_messages
+
     def readCurrentUnread(self,config_checked_greetings=0,config_greetings=''):
         new_messages = []
         # 获取当前对话框所有朋友消息
@@ -1196,16 +1278,16 @@ class DouDian():
             greeting_key = self._get_greeting_key()
             if self._should_send_greeting(greeting_key, my_messages, config_greetings):
                 self.sendBtnMsg(config_greetings)
-        current_max_index = max(msg['index'] for msg in friend_messages)
-        last_index = self.chat_last_friend_index.get(chat_key)
-        if last_index is None:
-            self.chat_last_friend_index[chat_key] = current_max_index
+        current_counts = self._build_message_counts(friend_messages)
+        previous_counts = self.chat_seen_friend_counts.get(chat_key)
+        if previous_counts is None:
+            self.chat_seen_friend_counts[chat_key] = current_counts
             print("\n没有新的消息。")
             print(f" - {new_messages}")
             return new_messages
 
-        new_messages = [msg for msg in friend_messages if msg['index'] > last_index]
-        self.chat_last_friend_index[chat_key] = current_max_index
+        new_messages = self._diff_new_messages(friend_messages, previous_counts)
+        self.chat_seen_friend_counts[chat_key] = current_counts
         if not new_messages:
             print(f" - {new_messages}")
             return new_messages
