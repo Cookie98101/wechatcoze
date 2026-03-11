@@ -26,7 +26,6 @@ class DouDian():
         self.link_cache = {}
         self.chat_last_friend_index = {}
         self.chat_seen_friend_counts = {}
-        self.last_user_nickname = ""
         self.last_chat_cache_key = ""
         self.greeting_sent_at = {}
         self.greeting_cooldown_seconds = 2 * 3600
@@ -467,6 +466,115 @@ class DouDian():
                 time.sleep(0.5)
                 return True
         return False
+
+    def _parse_session_key(self, session_key):
+        if not session_key or not isinstance(session_key, str):
+            return "", ""
+        if not session_key.startswith("conv::"):
+            return "", ""
+        raw = session_key[len("conv::"):]
+        if ":" not in raw:
+            return "", ""
+        attr, value = raw.split(":", 1)
+        attr = (attr or "").strip()
+        value = (value or "").strip()
+        if not attr or not value:
+            return "", ""
+        return attr, value
+
+    def _extract_conversation_nickname(self, item):
+        if not item:
+            return ""
+        # 新版飞鸽会话项通常会把昵称放在 title 属性里
+        title_selectors = [
+            '[title]',
+            '[class*="name"][title]',
+            '[class*="nick"][title]',
+        ]
+        for selector in title_selectors:
+            try:
+                el = item.query_selector(selector)
+                if not el:
+                    continue
+                title = (el.get_attribute('title') or '').strip()
+                if title:
+                    return re.sub(r"\s+", " ", title)
+            except Exception:
+                continue
+        try:
+            text = re.sub(r"\s+", " ", (item.inner_text() or '').strip())
+        except Exception:
+            text = ''
+        if not text:
+            return ''
+        # 文本兜底：取首段昵称，剔除常见状态词
+        text = re.sub(r"(重复来访|新客|老客|未读|已读|分钟前|小时前|刚刚).*", "", text).strip()
+        text = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?\b.*", "", text).strip()
+        if text:
+            return text[:40]
+        return ''
+
+    def _switch_to_session(self, session_key):
+        attr, value = self._parse_session_key(session_key)
+        if not attr or not value:
+            return False
+        norm_value = re.sub(r"\s+", " ", value).strip()
+        current_session = self.get_current_session_key()
+        if current_session == session_key:
+            return True
+        chat_items = self.page.query_selector_all(
+            '[data-kora="conversation"][data-qa-id="qa-conversation-chat-item"]'
+        )
+        if attr == "nickname":
+            for item in chat_items:
+                try:
+                    nickname = self._extract_conversation_nickname(item)
+                except Exception:
+                    nickname = ""
+                if not nickname:
+                    continue
+                if nickname == norm_value:
+                    item.click()
+                    time.sleep(0.5)
+                    return True
+            return False
+        if attr == "text":
+            for item in chat_items:
+                try:
+                    text = re.sub(r"\s+", " ", (item.inner_text() or '').strip())
+                except Exception:
+                    text = ""
+                if text and text == norm_value:
+                    item.click()
+                    time.sleep(0.5)
+                    return True
+            return False
+        for item in chat_items:
+            try:
+                item_val = (item.get_attribute(attr) or "").strip()
+            except Exception:
+                item_val = ""
+            if not item_val:
+                continue
+            if item_val == value:
+                item.click()
+                time.sleep(0.5)
+                return True
+        return False
+
+    def sendMsgToSession(self, session_key, msg, switch_back=True):
+        if not session_key or not msg:
+            return False
+        previous_session = self.get_current_session_key()
+        if not self._switch_to_session(session_key):
+            return False
+        self.sendMsg(msg)
+        if switch_back and previous_session and previous_session != session_key:
+            try:
+                self._switch_to_session(previous_session)
+            except Exception:
+                pass
+        return True
 
     def sendMsgToChat(self, chat_name, msg, switch_back=True):
         if not chat_name or not msg:
@@ -1011,10 +1119,7 @@ class DouDian():
             except Exception:
                 pass
 
-        if user_nickname:
-            self.last_user_nickname = user_nickname
-            return user_nickname
-        return self.last_user_nickname
+        return user_nickname
 
     def getCurrentChatName(self):
         return self._getCurrentUserName()
@@ -1039,6 +1144,11 @@ class DouDian():
                     for (const attr of attrs) {
                         const val = active.getAttribute(attr);
                         if (val) return `${attr}:${val}`;
+                    }
+                    const nameEl = active.querySelector('[title], [class*="name"][title], [class*="nick"][title]');
+                    if (nameEl) {
+                        const nick = norm(nameEl.getAttribute('title') || nameEl.textContent || '');
+                        if (nick) return `nickname:${nick.slice(0, 80)}`;
                     }
                     const text = norm(active.innerText);
                     return text ? `text:${text.slice(0, 80)}` : '';

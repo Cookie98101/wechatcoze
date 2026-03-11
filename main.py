@@ -642,22 +642,27 @@ class MainWindow(QMainWindow):
                     reply = '好的，已收到您的消息。'
                 return reply + '  ' + random.choice(random_reply_word) + random.choice(random_reply_character)
 
-            def send_reply_to_target(chat_name, reply_text):
-                if chat_name:
-                    sent_ok = dd.sendMsgToChat(chat_name, reply_text, switch_back=True)
-                    if sent_ok:
-                        return True
-                    current_chat = ''
-                    try:
-                        current_chat = dd.getCurrentChatName()
-                    except Exception:
-                        current_chat = ''
-                    if current_chat and (current_chat in chat_name or chat_name in current_chat):
-                        dd.sendMsg(reply_text)
-                        return True
-                    self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|会话定位失败，未发送（避免串会话）:'+str(chat_name))});")
+            def is_stable_session_key(session_key):
+                if not session_key or not isinstance(session_key, str):
                     return False
-                dd.sendMsg(reply_text)
+                if not session_key.startswith('conv::'):
+                    return False
+                if session_key.startswith('conv::text:'):
+                    return False
+                return ':' in session_key[len('conv::'):]
+
+            def send_reply_to_target(target_session_key, chat_name, reply_text):
+                if not is_stable_session_key(target_session_key):
+                    self.updateWebView.emit(
+                        f"py_add_msg({json.dumps(config_name+'|会话ID缺失，未发送（避免串会话）:'+str(chat_name))});"
+                    )
+                    return False
+                sent_ok = dd.sendMsgToSession(target_session_key, reply_text, switch_back=True)
+                if not sent_ok:
+                    self.updateWebView.emit(
+                        f"py_add_msg({json.dumps(config_name+'|会话定位失败，未发送（避免串会话）:'+str(chat_name)+'@'+str(target_session_key))});"
+                    )
+                    return False
                 return True
 
             def build_msg_signature(msg):
@@ -668,7 +673,7 @@ class MainWindow(QMainWindow):
                 product_link = str(msg.get('product_link', ''))
                 if msg_type == 'from_info':
                     return f"{msg_type}|{source}|{content}|{product_link}"
-                return f"{msg_type}|{msg.get('index', '')}|{content}|{src}|{product_link}"
+                return f"{msg_type}|{source}|{content}|{src}|{product_link}"
 
             llm_request_queue = queue.Queue()
             llm_result_queue = queue.Queue()
@@ -706,6 +711,7 @@ class MainWindow(QMainWindow):
                         llm_result_queue.put({
                             'session_key': session,
                             'chat_name': task.get('chat_name', ''),
+                            'target_session_key': task.get('target_session_key', ''),
                             'reply': holder.get('reply', ''),
                             'js_reply': holder.get('js_reply', ''),
                             'error': '',
@@ -714,6 +720,7 @@ class MainWindow(QMainWindow):
                         llm_result_queue.put({
                             'session_key': session,
                             'chat_name': task.get('chat_name', ''),
+                            'target_session_key': task.get('target_session_key', ''),
                             'reply': '',
                             'js_reply': '',
                             'error': str(e),
@@ -740,7 +747,8 @@ class MainWindow(QMainWindow):
                         try:
                             final_reply = normalize_reply_text(result.get('reply', ''))
                             target_chat = result.get('chat_name', '')
-                            send_reply_to_target(target_chat, final_reply)
+                            target_session_key = result.get('target_session_key', '')
+                            send_reply_to_target(target_session_key, target_chat, final_reply)
                         except Exception as e:
                             err_text = str(e)
                             logging.error(err_text)
@@ -756,8 +764,9 @@ class MainWindow(QMainWindow):
                             if pending_task.get('direct_reply'):
                                 direct_reply = pending_task.get('direct_reply', '')
                                 direct_chat = pending_task.get('chat_name', '')
+                                direct_session_key = pending_task.get('target_session_key', '')
                                 if direct_reply:
-                                    send_reply_to_target(direct_chat, direct_reply)
+                                    send_reply_to_target(direct_session_key, direct_chat, direct_reply)
                                     self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
                                 continue
                             llm_inflight_sessions.add(done_session)
@@ -813,6 +822,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         cache_key = ''
                     cache_key = cache_key or session_key or f"{config_platform}_default"
+                    target_session_key = ''
+                    if is_stable_session_key(session_key):
+                        target_session_key = session_key
 
                     now_sig_ts = time.time()
                     seen_map = processed_msg_signatures.setdefault(cache_key, {})
@@ -883,6 +895,10 @@ class MainWindow(QMainWindow):
                     receive_msg = raw_receive_msg
                     user_question = user_texts[-1].strip() if user_texts else ''
                     cache_key = cache_key or chat_name or f"{config_platform}_default"
+                    if not target_session_key:
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|会话ID缺失，跳过本轮（避免串会话）')});")
+                        time.sleep(wait)
+                        continue
                     latest_user_text = user_texts[-1].strip() if user_texts else ''
                     curr_sig = " | ".join(user_text_signatures)
                     if user_texts:
@@ -946,13 +962,10 @@ class MainWindow(QMainWindow):
                             else:
                                 receive_msg = latest_user_text or user_question or raw_receive_msg
                     if not user_texts and selected_product_event:
-                        product_only_waiting[cache_key] = {
-                            'ts': time.time(),
-                            'chat_name': chat_name
-                        }
-                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，等待用户提问(30s)')});")
-                        time.sleep(wait)
-                        continue
+                        product_only_waiting.pop(cache_key, None)
+                        auto_intro = '请基于以上商品信息，先回复一句简短商品介绍，并邀请用户提问。'
+                        receive_msg = f"{selected_product_event.get('text', raw_receive_msg)}\n用户问题:{auto_intro}"
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，已自动按商品信息回复')});")
                     if  receive_msg and designated_person and chat_name not in designated_person:
                         self.updateWebView.emit(f"py_add_msg({json.dumps('不在指定回复人中,默认不回复')});")
                         time.sleep(wait)
@@ -996,6 +1009,7 @@ class MainWindow(QMainWindow):
                         direct_task = {
                             'session_key': cache_key,
                             'chat_name': chat_name,
+                            'target_session_key': target_session_key,
                             'direct_reply': direct_reply,
                         }
                         if cache_key in llm_inflight_sessions:
@@ -1003,7 +1017,7 @@ class MainWindow(QMainWindow):
                             pending_tasks.append(direct_task)
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
                         else:
-                            send_reply_to_target(chat_name, direct_reply)
+                            send_reply_to_target(target_session_key, chat_name, direct_reply)
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
                         time.sleep(wait)
                         continue
@@ -1035,6 +1049,7 @@ class MainWindow(QMainWindow):
                         task = {
                             'session_key': cache_key,
                             'chat_name': chat_name,
+                            'target_session_key': target_session_key,
                             'receive_msg': payload,
                             'llm_user_key': llm_user_key,
                         }
@@ -1063,7 +1078,10 @@ class MainWindow(QMainWindow):
                         expired_waiting.append(key)
                         continue
                     try:
-                        sent_ok = dd.sendMsgToChat(chat_target, config_greetings, switch_back=True)
+                        target_session_key = meta.get('target_session_key', '')
+                        sent_ok = False
+                        if is_stable_session_key(target_session_key):
+                            sent_ok = dd.sendMsgToSession(target_session_key, config_greetings, switch_back=True)
                         if sent_ok:
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|30s无提问，已发送问候语:'+chat_target)});")
                             expired_waiting.append(key)
