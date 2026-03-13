@@ -791,17 +791,24 @@ class MainWindow(QMainWindow):
                 if msgs:
                     # 给客户连续发送“链接+问题”一个短聚合窗口，尽量同批处理，减少前后错位回复
                     try:
-                        time.sleep(0.7)
-                        extra_msgs = dd.getNextNewMessage(checkRedMessage=False,
-                                                          config_checked_greetings=config_checked_greetings,
-                                                          config_greetings=config_greetings)
-                        if extra_msgs:
-                            seen = {(m.get('index'), m.get('type'), m.get('content')) for m in msgs}
+                        seen = {(m.get('index'), m.get('type'), m.get('content')) for m in msgs}
+                        for _ in range(3):
+                            time.sleep(0.35)
+                            extra_msgs = dd.getNextNewMessage(checkRedMessage=False,
+                                                              config_checked_greetings=config_checked_greetings,
+                                                              config_greetings=config_greetings)
+                            if not extra_msgs:
+                                continue
+                            appended = 0
                             for m in extra_msgs:
                                 sig = (m.get('index'), m.get('type'), m.get('content'))
-                                if sig not in seen:
-                                    seen.add(sig)
-                                    msgs.append(m)
+                                if sig in seen:
+                                    continue
+                                seen.add(sig)
+                                msgs.append(m)
+                                appended += 1
+                            if appended == 0:
+                                break
                     except Exception:
                         pass
 

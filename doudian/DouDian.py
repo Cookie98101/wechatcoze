@@ -1388,15 +1388,19 @@ class DouDian():
             greeting_key = self._get_greeting_key()
             if self._should_send_greeting(greeting_key, my_messages, config_greetings):
                 self.sendBtnMsg(config_greetings)
-        current_counts = self._build_message_counts(friend_messages)
-        previous_counts = self.chat_seen_friend_counts.get(chat_key)
-        if previous_counts is None:
+        current_max_index = max(msg['index'] for msg in friend_messages)
+        last_index = self.chat_last_friend_index.get(chat_key)
+        if last_index is None:
+            self.chat_last_friend_index[chat_key] = current_max_index
+            current_counts = self._build_message_counts(friend_messages)
             self.chat_seen_friend_counts[chat_key] = current_counts
             print("\n没有新的消息。")
             print(f" - {new_messages}")
             return new_messages
 
-        new_messages = self._diff_new_messages(friend_messages, previous_counts)
+        new_messages = [msg for msg in friend_messages if msg['index'] > last_index]
+        self.chat_last_friend_index[chat_key] = current_max_index
+        current_counts = self._build_message_counts(friend_messages)
         self.chat_seen_friend_counts[chat_key] = current_counts
         if not new_messages:
             print(f" - {new_messages}")
