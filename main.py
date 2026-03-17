@@ -414,12 +414,15 @@ class MainWindow(QMainWindow):
             coze_util = None
             bailian_util = None
             fast_util = None
+            llm_prefix = 'coze'
             if config_chose_type== 0:
                 coze_util =CozeUtil(config_token,coze_api_base,config_bot_id)
             elif config_chose_type== 1:
                 bailian_util = BalianUtil(config_token,config_bot_id)
+                llm_prefix = 'bailian'
             elif config_chose_type== 2:
                 fast_util = FastGPTClient(config_bot_id,config_token)
+                llm_prefix = 'fastgpt'
 
             qianniu = QianNiu()
             global manual_intervention
@@ -530,12 +533,15 @@ class MainWindow(QMainWindow):
             coze_util = None
             bailian_util = None
             fast_util = None
+            llm_prefix = 'coze'
             if config_chose_type== 0:
                 coze_util =CozeUtil(config_token,coze_api_base,config_bot_id)
             elif config_chose_type== 1:
                 bailian_util = BalianUtil(config_token,config_bot_id)
+                llm_prefix = 'bailian'
             elif config_chose_type== 2:
                 fast_util = FastGPTClient(config_bot_id,config_token)
+                llm_prefix = 'fastgpt'
 
             global manual_intervention
             # 持续监听消息，有消息则对接大模型进行回复
@@ -548,13 +554,11 @@ class MainWindow(QMainWindow):
             last_refresh_time = time.time()
             product_cache = {}
             product_cache_ttl = 30 * 60
+            product_intro_waiting = {}
+            product_intro_wait_seconds = 2.0
             product_only_waiting = {}
-            last_user_msg_signature = {}
-            processed_msg_signatures = {}
             processed_transfer_signatures = set()
             product_only_wait_seconds = 30
-            duplicate_text_cooldown_seconds = 3
-            processed_msg_ttl_seconds = 6 * 3600
             product_markers = [
                 '咨询商品:',
                 '我要咨询商品名称:',
@@ -645,11 +649,9 @@ class MainWindow(QMainWindow):
             def is_stable_session_key(session_key):
                 if not session_key or not isinstance(session_key, str):
                     return False
-                if not session_key.startswith('conv::'):
+                if not session_key.startswith('conv::biz:'):
                     return False
-                if session_key.startswith('conv::text:'):
-                    return False
-                return ':' in session_key[len('conv::'):]
+                return bool(session_key[len('conv::biz:'):].strip())
 
             def send_reply_to_target(target_session_key, chat_name, reply_text):
                 if not is_stable_session_key(target_session_key):
@@ -665,15 +667,43 @@ class MainWindow(QMainWindow):
                     return False
                 return True
 
-            def build_msg_signature(msg):
-                msg_type = str(msg.get('type', ''))
-                content = re.sub(r'\s+', ' ', str(msg.get('content', '') or '').strip())
-                source = str(msg.get('source', ''))
-                src = str(msg.get('src', ''))
-                product_link = str(msg.get('product_link', ''))
-                if msg_type == 'from_info':
-                    return f"{msg_type}|{source}|{content}|{product_link}"
-                return f"{msg_type}|{source}|{content}|{src}|{product_link}"
+            def get_current_product_context(cache_key):
+                cached = product_cache.get(cache_key)
+                if not cached:
+                    return None
+                if time.time() - cached["ts"] > product_cache_ttl:
+                    return None
+                return cached
+
+            def is_meaningful_product_event(event):
+                if not event:
+                    return False
+                title = extract_product_title(event.get("text", ""))
+                product_id = event.get("product_id", "")
+                if title and title not in ("用户正在查看商品",):
+                    return True
+                return bool(product_id)
+
+            def build_llm_user_key(cache_key):
+                current_ctx = get_current_product_context(cache_key) or {}
+                suffix = current_ctx.get("product_id") or (
+                    f"v{current_ctx.get('version', 0)}" if current_ctx.get("version") else "session"
+                )
+                suffix = re.sub(r'[^0-9A-Za-z:_-]+', '_', str(suffix or "session"))[:64]
+                return f"{config_platform}_{llm_prefix}_{cache_key}_{suffix}"[:180]
+
+            def queue_llm_task(task):
+                session = task.get('session_key', '')
+                if session in llm_inflight_sessions:
+                    pending_tasks = llm_pending_by_session.setdefault(session, [])
+                    pending_tasks.append(task)
+                    self.updateWebView.emit(
+                        f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});"
+                    )
+                    return
+                llm_inflight_sessions.add(session)
+                llm_request_queue.put(task)
+                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
 
             llm_request_queue = queue.Queue()
             llm_result_queue = queue.Queue()
@@ -788,29 +818,6 @@ class MainWindow(QMainWindow):
                                                 config_greetings=config_greetings)
                 except Exception as e:
                     self.updateWebView.emit(f"py_add_msg({json.dumps(str(e)[:50])});")
-                if msgs:
-                    # 给客户连续发送“链接+问题”一个短聚合窗口，尽量同批处理，减少前后错位回复
-                    try:
-                        seen = {(m.get('index'), m.get('type'), m.get('content')) for m in msgs}
-                        for _ in range(3):
-                            time.sleep(0.35)
-                            extra_msgs = dd.getNextNewMessage(checkRedMessage=False,
-                                                              config_checked_greetings=config_checked_greetings,
-                                                              config_greetings=config_greetings)
-                            if not extra_msgs:
-                                continue
-                            appended = 0
-                            for m in extra_msgs:
-                                sig = (m.get('index'), m.get('type'), m.get('content'))
-                                if sig in seen:
-                                    continue
-                                seen.add(sig)
-                                msgs.append(m)
-                                appended += 1
-                            if appended == 0:
-                                break
-                    except Exception:
-                        pass
 
                 # 人工 跳出
                 if manual_intervention:
@@ -832,246 +839,195 @@ class MainWindow(QMainWindow):
                     target_session_key = ''
                     if is_stable_session_key(session_key):
                         target_session_key = session_key
-
-                    now_sig_ts = time.time()
-                    seen_map = processed_msg_signatures.setdefault(cache_key, {})
-                    fresh_msgs = []
-                    skipped_count = 0
-                    for message in msgs:
-                        sig = build_msg_signature(message)
-                        if not sig:
-                            fresh_msgs.append(message)
-                            continue
-                        last_seen_ts = seen_map.get(sig)
-                        if last_seen_ts and now_sig_ts - last_seen_ts < processed_msg_ttl_seconds:
-                            skipped_count += 1
-                            continue
-                        seen_map[sig] = now_sig_ts
-                        fresh_msgs.append(message)
-                    if seen_map:
-                        for sig, ts in list(seen_map.items()):
-                            if now_sig_ts - ts >= processed_msg_ttl_seconds:
-                                seen_map.pop(sig, None)
-                    if skipped_count > 0:
-                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|过滤历史重复消息:'+str(skipped_count))});")
-                    if not fresh_msgs:
-                        time.sleep(wait)
-                        continue
-                    msgs = fresh_msgs
-
-                    # 初始化一个空列表用于存储非空的文本内容
-                    contents = []
-                    chat_name = ''
-                    product_events_primary = []
-                    product_events_panel = []
-                    user_texts = []
-                    user_text_signatures = []
-                    # 遍历messages列表
-                    for message in msgs:
-                        if (message['type'] == 'text' or message['type'] == 'card' or message['type'] == 'from_info' or message['type'] == 'img') and message['content'].strip():  # 确保类型为text且内容不为空（去除首尾空白后）
-                            chat_name = message['who']
-                            contents.append(message['content'])
-                            if message['type'] in ('text', 'card', 'from_info') and any(m in message['content'] for m in product_markers):
-                                if '没有咨询过宝贝' not in message['content'] and '暂无咨询' not in message['content'] and '暂无商品' not in message['content']:
-                                    source = message.get('source', '')
-                                    if message['type'] == 'card':
-                                        normalized_source = 'card'
-                                    elif source in ('link', 'system', 'panel'):
-                                        normalized_source = source
-                                    else:
-                                        normalized_source = 'text'
-                                    event = {
-                                        "text": message['content'],
-                                        "source": normalized_source,
-                                        "product_id": extract_product_id(message['content']),
-                                    }
-                                    if normalized_source in ('card', 'link', 'system', 'text'):
-                                        product_events_primary.append(event)
-                                    elif normalized_source == 'panel':
-                                        product_events_panel.append(event)
-                            if message['type'] == 'text':
-                                user_texts.append(message['content'])
-                                user_text_signatures.append(f"{message.get('index','')}::{message['content']}")
-                            # 处理消息逻辑
-                        else:
-                            #未识别的消息
-                            chat_name = message['who']
-                            contents.append('你好')
-                    # 原始聚合内容（仅用于解析/调试），模型输入后续会压缩为“最新问题+商品上下文”
-                    raw_receive_msg = ','.join(contents)
-                    receive_msg = raw_receive_msg
-                    user_question = user_texts[-1].strip() if user_texts else ''
-                    cache_key = cache_key or chat_name or f"{config_platform}_default"
                     if not target_session_key:
                         self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|会话ID缺失，跳过本轮（避免串会话）')});")
                         time.sleep(wait)
                         continue
-                    latest_user_text = user_texts[-1].strip() if user_texts else ''
-                    curr_sig = " | ".join(user_text_signatures)
-                    if user_texts:
-                        prev_sig_info = last_user_msg_signature.get(cache_key)
-                        if (
-                            prev_sig_info
-                            and prev_sig_info.get("sig") == curr_sig
-                            and now_sig_ts - prev_sig_info.get("ts", 0) < duplicate_text_cooldown_seconds
-                        ):
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|检测到重复客户消息，跳过本轮')});")
-                            time.sleep(wait)
+                    batch_chat_name = ''
+                    saw_user_text = False
+                    pending_auto_intro = None
+
+                    for message in msgs:
+                        msg_type = message.get('type', '')
+                        msg_content = (message.get('content') or '').strip()
+                        if not msg_content:
                             continue
-                        last_user_msg_signature[cache_key] = {"sig": curr_sig, "ts": now_sig_ts}
-                        product_only_waiting.pop(cache_key, None)
-                    # 防止“已售xx件”进入模型上下文，避免回复夹带销量信息
-                    raw_receive_msg = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', raw_receive_msg)
-                    raw_receive_msg = re.sub(r'\\s{2,}', ' ', raw_receive_msg).strip()
-                    receive_msg = raw_receive_msg
-                    selected_primary_event = product_events_primary[-1] if product_events_primary else None
-                    selected_panel_event = product_events_panel[-1] if product_events_panel else None
-                    selected_product_event = selected_primary_event or selected_panel_event
-                    context_info = None
-                    if selected_primary_event:
-                        context_info = update_product_context(cache_key, selected_primary_event, is_primary_source=True)
-                    elif selected_panel_event:
-                        current_ctx = product_cache.get(cache_key)
-                        if not (current_ctx and current_ctx.get("locked_primary")):
-                            context_info = update_product_context(cache_key, selected_panel_event, is_primary_source=False)
-                    elif any(m in raw_receive_msg for m in product_markers):
-                        if '没有咨询过宝贝' in raw_receive_msg or '暂无咨询' in raw_receive_msg or '暂无商品' in raw_receive_msg:
-                            pass
-                        else:
-                            current_ctx = product_cache.get(cache_key)
-                            if not (current_ctx and current_ctx.get("locked_primary")):
-                                fallback_event = {
-                                    "text": raw_receive_msg,
-                                    "source": "text",
-                                    "product_id": extract_product_id(raw_receive_msg),
+                        chat_name = message.get('who', '') or batch_chat_name
+                        if chat_name:
+                            batch_chat_name = chat_name
+
+                        if msg_type in ('card', 'from_info') and any(m in msg_content for m in product_markers):
+                            if '没有咨询过宝贝' not in msg_content and '暂无咨询' not in msg_content and '暂无商品' not in msg_content:
+                                source = message.get('source', '')
+                                if msg_type == 'card':
+                                    normalized_source = 'card'
+                                elif source in ('link', 'system', 'panel'):
+                                    normalized_source = source
+                                else:
+                                    normalized_source = 'text'
+                                event = {
+                                    "text": msg_content,
+                                    "source": normalized_source,
+                                    "product_id": extract_product_id(msg_content),
                                 }
-                                context_info = update_product_context(cache_key, fallback_event, is_primary_source=False)
-                    if context_info:
-                        self.updateWebView.emit(
-                            f"py_add_msg({json.dumps(config_name + '|商品上下文更新 session=' + format_session_for_log(cache_key) + ' source=' + context_info.get('source', '-') + ' id=' + (context_info.get('product_id', '-') or '-') + ' v=' + str(context_info.get('version', 1)))});"
-                        )
-                    if user_texts and not any(m in raw_receive_msg for m in product_markers):
-                        cached = product_cache.get(cache_key)
-                        if cached and time.time() - cached["ts"] <= product_cache_ttl:
-                            receive_msg = f"{cached['text']}\n用户问题:{user_question or latest_user_text or raw_receive_msg}"
-                            self.updateWebView.emit(
-                                f"py_add_msg({json.dumps(config_name + '|复用商品上下文 session=' + format_session_for_log(cache_key) + ' source=' + cached.get('source', '-') + ' id=' + (cached.get('product_id', '-') or '-') + ' v=' + str(cached.get('version', 1)))});"
-                            )
-                        else:
-                            receive_msg = latest_user_text or user_question or raw_receive_msg
-                    if user_texts and any(m in raw_receive_msg for m in product_markers):
-                        if selected_product_event:
-                            receive_msg = f"{selected_product_event.get('text', raw_receive_msg)}\n用户问题:{latest_user_text or user_question or raw_receive_msg}"
-                        else:
-                            cached = product_cache.get(cache_key)
-                            if cached and time.time() - cached["ts"] <= product_cache_ttl:
-                                receive_msg = f"{cached.get('text', raw_receive_msg)}\n用户问题:{latest_user_text or user_question or raw_receive_msg}"
-                            else:
-                                receive_msg = latest_user_text or user_question or raw_receive_msg
-                    if not user_texts and selected_product_event:
+                                if is_meaningful_product_event(event):
+                                    is_primary_source = normalized_source in ('card', 'link', 'system', 'text')
+                                    current_ctx = product_cache.get(cache_key)
+                                    if is_primary_source or not (current_ctx and current_ctx.get("locked_primary")):
+                                        context_info = update_product_context(cache_key, event, is_primary_source=is_primary_source)
+                                        self.updateWebView.emit(
+                                            f"py_add_msg({json.dumps(config_name + '|商品上下文更新 session=' + format_session_for_log(cache_key) + ' source=' + context_info.get('source', '-') + ' id=' + (context_info.get('product_id', '-') or '-') + ' v=' + str(context_info.get('version', 1)))});"
+                                        )
+                                        if msg_type in ('card', 'from_info'):
+                                            pending_auto_intro = {
+                                                'chat_name': chat_name,
+                                                'target_session_key': target_session_key,
+                                            }
+
+                    for message in msgs:
+                        msg_type = message.get('type', '')
+                        msg_content = (message.get('content') or '').strip()
+                        if not msg_content:
+                            continue
+                        chat_name = message.get('who', '') or batch_chat_name
+                        if chat_name:
+                            batch_chat_name = chat_name
+
+                        if msg_type != 'text':
+                            continue
+
+                        saw_user_text = True
+                        pending_auto_intro = None
+                        product_intro_waiting.pop(cache_key, None)
                         product_only_waiting.pop(cache_key, None)
-                        auto_intro = '请基于以上商品信息，先回复一句简短商品介绍，并邀请用户提问。'
-                        receive_msg = f"{selected_product_event.get('text', raw_receive_msg)}\n用户问题:{auto_intro}"
-                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，已自动按商品信息回复')});")
-                    if  receive_msg and designated_person and chat_name not in designated_person:
-                        self.updateWebView.emit(f"py_add_msg({json.dumps('不在指定回复人中,默认不回复')});")
-                        time.sleep(wait)
-                        continue
-                    self.updateWebView.emit(f"py_add_msg({json.dumps('===============')});")
-                    js_receive_msg = f"{config_name}|收到消息::{receive_msg}"
-                    self.updateWebView.emit(f"py_add_msg({json.dumps(js_receive_msg)});")
-                    # 只使用客户文本触发转交，避免商品卡片里的售后词误触发
-                    transfer_source_text = latest_user_text or ''
-                    if transfer_source_text and transfer_name and transfer_keyword and any(s in transfer_source_text for s in transfer_keyword):
-                        transfer_sig = f"{cache_key}::{curr_sig or transfer_source_text}"
-                        if transfer_sig in processed_transfer_signatures:
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|重复转交触发，已忽略')});")
+                        latest_user_text = msg_content
+                        curr_sig = f"{message.get('index', '')}::{latest_user_text}"
+                        raw_receive_msg = re.sub(r'已售\\s*\\d+(?:\\.\\d+)?\\s*(?:件|单|笔)?', '', latest_user_text)
+                        raw_receive_msg = re.sub(r'\\s{2,}', ' ', raw_receive_msg).strip()
+                        current_ctx = get_current_product_context(cache_key)
+                        receive_msg = raw_receive_msg or latest_user_text
+                        if current_ctx and not any(m in receive_msg for m in product_markers):
+                            receive_msg = f"{current_ctx['text']}\n用户问题:{latest_user_text}"
+                            self.updateWebView.emit(
+                                f"py_add_msg({json.dumps(config_name + '|复用商品上下文 session=' + format_session_for_log(cache_key) + ' source=' + current_ctx.get('source', '-') + ' id=' + (current_ctx.get('product_id', '-') or '-') + ' v=' + str(current_ctx.get('version', 1)))});"
+                            )
+
+                        if receive_msg and designated_person and chat_name not in designated_person:
+                            self.updateWebView.emit(f"py_add_msg({json.dumps('不在指定回复人中,默认不回复')});")
                             time.sleep(wait)
                             continue
-                        processed_transfer_signatures.add(transfer_sig)
-                        def single_transfer(name):
-                            if str(name).startswith('未找到'):
-                                return
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在转接给:'+name)});")
-                        dd.transferOther(transfer_name,single_transfer)
-                        time.sleep(wait)
-                        continue
 
-                    # 商品ID类问题优先走本地确定性回复，避免模型空答/乱答
-                    if latest_user_text and any(re.search(p, latest_user_text, flags=re.IGNORECASE) for p in id_question_patterns):
-                        local_ctx = receive_msg
-                        cached = product_cache.get(cache_key)
-                        if cached and time.time() - cached["ts"] <= product_cache_ttl:
-                            local_ctx = f"{cached.get('text', '')}\n{receive_msg}"
-                        title = extract_product_title(local_ctx)
-                        if title:
-                            direct_reply = f"商品ID（商品标题）是“{title}”。"
-                        else:
-                            matched_id = extract_product_id(local_ctx)
-                            if matched_id:
-                                direct_reply = f"商品ID是{matched_id}。"
-                            else:
-                                direct_reply = "当前消息里未识别到商品标题，请再发一次商品卡片。"
-                        direct_reply = direct_reply + '  ' + random.choice(random_reply_word) + random.choice(random_reply_character)
-                        direct_task = {
-                            'session_key': cache_key,
-                            'chat_name': chat_name,
-                            'target_session_key': target_session_key,
-                            'direct_reply': direct_reply,
-                        }
-                        if cache_key in llm_inflight_sessions:
-                            pending_tasks = llm_pending_by_session.setdefault(cache_key, [])
-                            pending_tasks.append(direct_task)
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
-                        else:
-                            send_reply_to_target(target_session_key, chat_name, direct_reply)
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
-                        time.sleep(wait)
-                        continue
+                        self.updateWebView.emit(f"py_add_msg({json.dumps('===============')});")
+                        js_receive_msg = f"{config_name}|收到消息::{receive_msg}"
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(js_receive_msg)});")
 
-                    llm_prefix = 'coze'
-                    if config_chose_type == 1:
-                        llm_prefix = 'bailian'
-                    elif config_chose_type == 2:
-                        llm_prefix = 'fastgpt'
-                    llm_user_key = f"{config_platform}_{llm_prefix}_{cache_key}"
-                    task_payloads = [receive_msg]
-                    if user_texts and len(user_texts) > 1:
-                        clean_questions = [q.strip() for q in user_texts if q and q.strip()]
-                        if clean_questions:
-                            context_text = ''
-                            if selected_product_event:
-                                context_text = selected_product_event.get('text', '')
-                            else:
-                                cached = product_cache.get(cache_key)
-                                if cached and time.time() - cached["ts"] <= product_cache_ttl:
-                                    context_text = cached.get('text', '')
-                            if context_text:
-                                task_payloads = [f"{context_text}\n用户问题:{q}" for q in clean_questions]
-                            else:
-                                task_payloads = clean_questions
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|检测到连续提问，逐条入队:'+str(len(task_payloads)))});")
+                        if latest_user_text and transfer_name and transfer_keyword and any(s in latest_user_text for s in transfer_keyword):
+                            transfer_sig = f"{cache_key}::{curr_sig or latest_user_text}"
+                            if transfer_sig in processed_transfer_signatures:
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|重复转交触发，已忽略')});")
+                                time.sleep(wait)
+                                continue
+                            processed_transfer_signatures.add(transfer_sig)
 
-                    for payload in task_payloads:
+                            def single_transfer(name):
+                                if str(name).startswith('未找到'):
+                                    return
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在转接给:'+name)});")
+
+                            dd.transferOther(transfer_name, single_transfer)
+                            time.sleep(wait)
+                            continue
+
+                        if latest_user_text and any(re.search(p, latest_user_text, flags=re.IGNORECASE) for p in id_question_patterns):
+                            local_ctx = receive_msg
+                            current_ctx = get_current_product_context(cache_key)
+                            if current_ctx:
+                                local_ctx = f"{current_ctx.get('text', '')}\n{receive_msg}"
+                            title = extract_product_title(local_ctx)
+                            if title:
+                                direct_reply = f"商品ID（商品标题）是“{title}”。"
+                            else:
+                                matched_id = extract_product_id(local_ctx)
+                                if matched_id:
+                                    direct_reply = f"商品ID是{matched_id}。"
+                                else:
+                                    direct_reply = "当前消息里未识别到商品标题，请再发一次商品卡片。"
+                            direct_reply = direct_reply + '  ' + random.choice(random_reply_word) + random.choice(random_reply_character)
+                            direct_task = {
+                                'session_key': cache_key,
+                                'chat_name': chat_name,
+                                'target_session_key': target_session_key,
+                                'direct_reply': direct_reply,
+                            }
+                            if cache_key in llm_inflight_sessions:
+                                pending_tasks = llm_pending_by_session.setdefault(cache_key, [])
+                                pending_tasks.append(direct_task)
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
+                            else:
+                                send_reply_to_target(target_session_key, chat_name, direct_reply)
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
+                            time.sleep(wait)
+                            continue
+
                         task = {
                             'session_key': cache_key,
                             'chat_name': chat_name,
                             'target_session_key': target_session_key,
-                            'receive_msg': payload,
-                            'llm_user_key': llm_user_key,
+                            'receive_msg': receive_msg,
+                            'llm_user_key': build_llm_user_key(cache_key),
                         }
-                        if cache_key in llm_inflight_sessions:
-                            pending_tasks = llm_pending_by_session.setdefault(cache_key, [])
-                            pending_tasks.append(task)
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
-                        else:
-                            llm_inflight_sessions.add(cache_key)
-                            llm_request_queue.put(task)
-                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
+                        queue_llm_task(task)
+
+                    if not saw_user_text and pending_auto_intro:
+                        current_ctx = get_current_product_context(cache_key)
+                        if current_ctx:
+                            product_intro_waiting[cache_key] = {
+                                'ts': time.time(),
+                                'chat_name': pending_auto_intro.get('chat_name', batch_chat_name),
+                                'target_session_key': pending_auto_intro.get('target_session_key', target_session_key),
+                                'product_version': current_ctx.get('version', 0),
+                            }
+                            self.updateWebView.emit(
+                                f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，自动介绍降级等待'+str(int(product_intro_wait_seconds))+'s')});"
+                            )
 
                 if stop_event.is_set():
                     break
                 now_ts = time.time()
+                expired_intro = []
+                for key, meta in list(product_intro_waiting.items()):
+                    if now_ts - meta['ts'] < product_intro_wait_seconds:
+                        continue
+                    current_ctx = get_current_product_context(key)
+                    if not current_ctx:
+                        expired_intro.append(key)
+                        continue
+                    if meta.get('product_version') and current_ctx.get('version') != meta.get('product_version'):
+                        expired_intro.append(key)
+                        continue
+                    chat_name = meta.get('chat_name', '')
+                    if current_ctx.get('text') and designated_person and chat_name not in designated_person:
+                        self.updateWebView.emit(f"py_add_msg({json.dumps('不在指定回复人中,默认不回复')});")
+                        expired_intro.append(key)
+                        continue
+                    auto_intro = '请基于以上商品信息，先回复一句简短商品介绍，并邀请用户提问。'
+                    receive_msg = f"{current_ctx.get('text', '')}\n用户问题:{auto_intro}"
+                    self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|仅收到商品信息，已自动按商品信息回复')});")
+                    self.updateWebView.emit(f"py_add_msg({json.dumps('===============')});")
+                    js_receive_msg = f"{config_name}|收到消息::{receive_msg}"
+                    self.updateWebView.emit(f"py_add_msg({json.dumps(js_receive_msg)});")
+                    task = {
+                        'session_key': key,
+                        'chat_name': chat_name,
+                        'target_session_key': meta.get('target_session_key', ''),
+                        'receive_msg': receive_msg,
+                        'llm_user_key': build_llm_user_key(key),
+                    }
+                    queue_llm_task(task)
+                    expired_intro.append(key)
+                for key in expired_intro:
+                    product_intro_waiting.pop(key, None)
+
                 expired_waiting = []
                 for key, meta in list(product_only_waiting.items()):
                     if now_ts - meta['ts'] < product_only_wait_seconds:
