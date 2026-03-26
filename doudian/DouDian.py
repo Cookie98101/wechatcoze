@@ -1,4 +1,4 @@
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from playwright.sync_api import sync_playwright
 import json
 import os,time,random, re
@@ -38,6 +38,8 @@ class DouDian():
         self.conversation_cache = {}
         self.conversation_ids_by_nickname = {}
         self.conversation_row_cache = {}
+        self.prefetched_session_batches = deque()
+        self.prefetched_session_batch_keys = set()
 
     # 启动
     def launchChat(self, config_checked_pwd_login=0, config_username='', config_pwd=''):
@@ -1035,39 +1037,269 @@ class DouDian():
 
     # 获取下一条最新消息
     def getNextNewMessage(self,checkRedMessage = True,config_checked_greetings=0,config_greetings=''):
+        prefetched_batch = self._pop_prefetched_session_batch()
+        if prefetched_batch:
+            target_session_key = prefetched_batch.get("session_key", "")
+            if target_session_key and self._is_biz_session_key(target_session_key):
+                current_session_key = self.get_current_session_key()
+                if current_session_key != target_session_key and not self._switch_to_session(target_session_key):
+                    self._enqueue_prefetched_session_batch(target_session_key, prefetched_batch.get("messages", []))
+                else:
+                    return prefetched_batch.get("messages", [])
+            else:
+                return prefetched_batch.get("messages", [])
+
+        current_session_key = self.get_current_session_key()
         # 如果停留在当前对话框 先判断当前对话框是否有新消息
         new_msgs = self.readCurrentUnread(config_checked_greetings,config_greetings)
-        if  new_msgs:
-            return new_msgs
 
         if not checkRedMessage:
-            return []
-        # 查找第一个 chat-list 下的所有 chat-item
-        chat_items = self.page.query_selector_all(
-            '[data-kora="conversation"][data-qa-id="qa-conversation-chat-item"]'
+            return new_msgs
+
+        self._prefetch_other_unread_sessions(
+            current_session_key,
+            config_checked_greetings=config_checked_greetings,
+            config_greetings=config_greetings,
+        )
+        self._prefetch_runtime_priority_sessions(
+            current_session_key,
+            config_checked_greetings=config_checked_greetings,
+            config_greetings=config_greetings,
         )
 
-        # print(f"发现 {chat_items.count()} 个会话项")
-        # 判断对话列表是否有新消息 有的话 取第一个
-        for item in chat_items:
-            # 获取背景颜色
-            bg_color = item.evaluate(
-                "element => window.getComputedStyle(element).backgroundColor"
+        if new_msgs:
+            return new_msgs
+
+        prefetched_batch = self._pop_prefetched_session_batch()
+        if not prefetched_batch:
+            return []
+        target_session_key = prefetched_batch.get("session_key", "")
+        if target_session_key and self._is_biz_session_key(target_session_key):
+            current_session_key = self.get_current_session_key()
+            if current_session_key != target_session_key and not self._switch_to_session(target_session_key):
+                self._enqueue_prefetched_session_batch(target_session_key, prefetched_batch.get("messages", []))
+                return []
+        return prefetched_batch.get("messages", [])
+
+    def _enqueue_prefetched_session_batch(self, session_key, messages):
+        if not self._is_biz_session_key(session_key) or not messages:
+            return
+        if session_key in self.prefetched_session_batch_keys:
+            return
+        self.prefetched_session_batches.append({
+            "session_key": session_key,
+            "messages": list(messages),
+        })
+        self.prefetched_session_batch_keys.add(session_key)
+
+    def _pop_prefetched_session_batch(self):
+        while self.prefetched_session_batches:
+            batch = self.prefetched_session_batches.popleft()
+            session_key = batch.get("session_key", "")
+            if session_key:
+                self.prefetched_session_batch_keys.discard(session_key)
+            messages = batch.get("messages", [])
+            if session_key and messages:
+                return batch
+        return None
+
+    def _get_visible_unread_conversation_rows(self):
+        try:
+            return self.page.evaluate(
+                """() => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    return Array.from(document.querySelectorAll('[data-kora="conversation"][data-qa-id="qa-conversation-chat-item"]')).map((el, index) => {
+                        const bg = window.getComputedStyle(el).backgroundColor || '';
+                        const hasBadge = !!el.querySelector('.auxo-badge-count');
+                        const ariaSelected = (el.getAttribute('aria-selected') || '') === 'true';
+                        return {
+                            index,
+                            btm: el.getAttribute('data-btm-id') || '',
+                            title: el.querySelector('[title]')?.getAttribute('title') || '',
+                            text: norm(el.innerText || ''),
+                            className: el.className || '',
+                            selected: ariaSelected || /active|selected/i.test(el.className || ''),
+                            isUnread: bg === 'rgb(255, 243, 232)' || hasBadge,
+                        };
+                    });
+                }"""
             )
-            # 检查是否为未读颜色
-            is_unread = bg_color == 'rgb(255, 243, 232)'
-            # 额外验证：检查是否有未读标识（如红点）
-            unread_badge = item.query_selector(".auxo-badge-count")
-            if is_unread or unread_badge is not None:
-                item.click()
-                time.sleep(1)  # 等待页面加载
-                # 加装未读消息
+        except Exception:
+            return []
+
+    def _get_runtime_priority_session_candidates(self):
+        try:
+            rows = self.page.evaluate(
+                """() => {
+                    const store = window.__monaGlobalStore?.getData?.()?.initContextData?.Store?.instance;
+                    const ci = store?.conversationsInfo;
+                    const bm = store?.buyerMap;
+                    if (!ci?.conversationMap?.values) return [];
+                    const waitReply = new Set((bm?.waitReplyBuyers || []).map((v) => String(v || '').trim()).filter(Boolean));
+                    const overThree = new Set((bm?.overThreeBuyers || []).map((v) => String(v || '').trim()).filter(Boolean));
+                    const list = Array.from(ci.conversationMap.values())
+                        .filter((conv) => conv && conv.id && !conv.closed && conv.countdown && conv.buyerId)
+                        .map((conv) => {
+                            const buyerId = String(conv.buyerId || '').trim();
+                            let priority = 1;
+                            if (overThree.has(buyerId)) priority = 3;
+                            else if (waitReply.has(buyerId)) priority = 2;
+                            return {
+                                session_key: `conv::biz:${String(conv.id || '').trim()}`,
+                                buyer_id: buyerId,
+                                countdown_time: Number(conv.countdownTime || 0),
+                                unread_count: Number(conv.unreadCount || 0),
+                                priority,
+                            };
+                        })
+                        .filter((item) => item.session_key !== 'conv::biz:' && item.buyer_id);
+                    list.sort((a, b) => {
+                        if (b.priority !== a.priority) return b.priority - a.priority;
+                        if (a.countdown_time && b.countdown_time && a.countdown_time !== b.countdown_time) {
+                            return a.countdown_time - b.countdown_time;
+                        }
+                        if (b.unread_count !== a.unread_count) return b.unread_count - a.unread_count;
+                        return a.session_key.localeCompare(b.session_key);
+                    });
+                    return list;
+                }"""
+            )
+        except Exception:
+            return []
+        return rows if isinstance(rows, list) else []
+
+    def get_runtime_unreplied_sessions(self):
+        try:
+            rows = self.page.evaluate(
+                """() => {
+                    const store = window.__monaGlobalStore?.getData?.()?.initContextData?.Store?.instance;
+                    const ci = store?.conversationsInfo;
+                    const bm = store?.buyerMap;
+                    if (!ci?.conversationMap?.values) return [];
+                    const waitReply = new Set((bm?.waitReplyBuyers || []).map((v) => String(v || '').trim()).filter(Boolean));
+                    const overThree = new Set((bm?.overThreeBuyers || []).map((v) => String(v || '').trim()).filter(Boolean));
+                    const servicing = new Set((bm?.servicingBuyers || []).map((v) => String(v || '').trim()).filter(Boolean));
+                    return Array.from(ci.conversationMap.values())
+                        .filter((conv) => conv && conv.id && !conv.closed)
+                        .map((conv) => {
+                            const buyerId = String(conv?.buyerId || '').trim();
+                            const unreadCount = Number(conv?.unreadCount || 0);
+                            const countdown = !!conv?.countdown;
+                            const countdownTime = Number(conv?.countdownTime || 0);
+                            const inWaitReply = buyerId ? waitReply.has(buyerId) : false;
+                            const inOverThree = buyerId ? overThree.has(buyerId) : false;
+                            const inServicing = buyerId ? servicing.has(buyerId) : false;
+                            const unreplied = unreadCount > 0 || inWaitReply || inOverThree || countdown;
+                            return {
+                                session_key: `conv::biz:${String(conv?.id || '').trim()}`,
+                                buyer_id: buyerId,
+                                unread_count: unreadCount,
+                                countdown,
+                                countdown_time: countdownTime,
+                                in_wait_reply: inWaitReply,
+                                in_over_three: inOverThree,
+                                in_servicing: inServicing,
+                                unreplied,
+                            };
+                        })
+                        .filter((item) => item.session_key !== 'conv::biz:' && item.buyer_id && item.unreplied)
+                        .sort((a, b) => {
+                            const pa = a.in_over_three ? 3 : (a.in_wait_reply || a.countdown ? 2 : 1);
+                            const pb = b.in_over_three ? 3 : (b.in_wait_reply || b.countdown ? 2 : 1);
+                            if (pb !== pa) return pb - pa;
+                            if (a.countdown_time && b.countdown_time && a.countdown_time !== b.countdown_time) {
+                                return a.countdown_time - b.countdown_time;
+                            }
+                            if (b.unread_count !== a.unread_count) return b.unread_count - a.unread_count;
+                            return a.session_key.localeCompare(b.session_key);
+                        });
+                }"""
+            )
+        except Exception:
+            return []
+        return rows if isinstance(rows, list) else []
+
+    def _prefetch_runtime_priority_sessions(self, current_session_key, config_checked_greetings=0, config_greetings=''):
+        original_session_key = current_session_key if self._is_biz_session_key(current_session_key) else self.get_current_session_key()
+        candidates = self._get_runtime_priority_session_candidates()
+        if not candidates:
+            return
+        try:
+            for candidate in candidates:
+                session_key = candidate.get("session_key", "")
+                if not self._is_biz_session_key(session_key):
+                    continue
+                if session_key == original_session_key:
+                    continue
+                if session_key in self.prefetched_session_batch_keys:
+                    continue
+                if not self._switch_to_session(session_key):
+                    continue
+                new_msgs = self._getAfterSwitchMsg(config_checked_greetings, config_greetings)
+                if new_msgs:
+                    self._enqueue_prefetched_session_batch(session_key, new_msgs)
+        finally:
+            current_session = self.get_current_session_key()
+            if (
+                self._is_biz_session_key(original_session_key)
+                and current_session != original_session_key
+            ):
+                try:
+                    self._switch_to_session(original_session_key)
+                except Exception:
+                    pass
+
+    def _prefetch_other_unread_sessions(self, current_session_key, config_checked_greetings=0, config_greetings=''):
+        attempted_rows = set()
+        max_probe_count = 12
+        probe_count = 0
+        original_session_key = current_session_key if self._is_biz_session_key(current_session_key) else self.get_current_session_key()
+        try:
+            while probe_count < max_probe_count:
+                rows = self._get_visible_unread_conversation_rows()
+                target_row = None
+                for row in rows:
+                    if not row.get("isUnread"):
+                        continue
+                    if row.get("selected"):
+                        continue
+                    row_signature = "|".join([
+                        str(row.get("index", "")),
+                        str(row.get("btm", "")),
+                        self._normalize_text(row.get("title", "")),
+                        self._normalize_text(row.get("text", ""))[:120],
+                    ])
+                    if row_signature in attempted_rows:
+                        continue
+                    target_row = dict(row)
+                    target_row["signature"] = row_signature
+                    break
+                if not target_row:
+                    break
+                attempted_rows.add(target_row["signature"])
+                probe_count += 1
+                if not self._click_conversation_row_by_index(target_row.get("index", -1)):
+                    continue
+                session_key = self.get_current_session_key()
+                if not self._is_biz_session_key(session_key):
+                    continue
+                if session_key == original_session_key:
+                    continue
+                if session_key in self.prefetched_session_batch_keys:
+                    continue
                 new_msgs = self._getAfterSwitchMsg(config_checked_greetings,config_greetings)
-                if  new_msgs:
-                    print('新框消息=========')
-                    print(new_msgs)
-                    return new_msgs
-        return []
+                if new_msgs:
+                    self._enqueue_prefetched_session_batch(session_key, new_msgs)
+        finally:
+            current_session = self.get_current_session_key()
+            if (
+                self._is_biz_session_key(original_session_key)
+                and current_session != original_session_key
+            ):
+                try:
+                    self._switch_to_session(original_session_key)
+                except Exception:
+                    pass
 
     # 点击新对话 加载未读消息 加载的原理就是找到我的消息的最后一个的之后的都是未读消息
     # 加载完需要更新 last_messages

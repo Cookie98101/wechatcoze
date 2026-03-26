@@ -61,6 +61,10 @@ class FakePage:
         self.current_conversation_id = current_conversation_id
         self.current_buyer_id = current_buyer_id
         self.active_tab = active_tab
+        self.runtime_wait_reply_buyers = []
+        self.runtime_over_three_buyers = []
+        self.runtime_servicing_buyers = []
+        self.runtime_conversations = []
 
     def _visible_rows(self):
         if self.active_tab == "recent":
@@ -79,6 +83,39 @@ class FakePage:
         return None
 
     def evaluate(self, script, arg=None):
+        if "item.unreplied" in script or ".filter((item) => item.session_key !== 'conv::biz:' && item.buyer_id && item.unreplied)" in script:
+            wait_reply = {str(v).strip() for v in self.runtime_wait_reply_buyers}
+            over_three = {str(v).strip() for v in self.runtime_over_three_buyers}
+            servicing = {str(v).strip() for v in self.runtime_servicing_buyers}
+            rows = []
+            for conv in self.runtime_conversations:
+                buyer_id = str(conv.get("buyerId", "")).strip()
+                unread_count = int(conv.get("unreadCount", 0) or 0)
+                countdown = bool(conv.get("countdown"))
+                countdown_time = int(conv.get("countdownTime", 0) or 0)
+                in_wait_reply = buyer_id in wait_reply if buyer_id else False
+                in_over_three = buyer_id in over_three if buyer_id else False
+                in_servicing = buyer_id in servicing if buyer_id else False
+                unreplied = unread_count > 0 or in_wait_reply or in_over_three or countdown
+                if conv.get("id") and buyer_id and not conv.get("closed") and unreplied:
+                    rows.append({
+                        "session_key": f"conv::biz:{str(conv.get('id', '')).strip()}",
+                        "buyer_id": buyer_id,
+                        "unread_count": unread_count,
+                        "countdown": countdown,
+                        "countdown_time": countdown_time,
+                        "in_wait_reply": in_wait_reply,
+                        "in_over_three": in_over_three,
+                        "in_servicing": in_servicing,
+                        "unreplied": unreplied,
+                    })
+            rows.sort(key=lambda item: (
+                -(3 if item["in_over_three"] else (2 if item["in_wait_reply"] or item["countdown"] else 1)),
+                item["countdown_time"] if item["countdown_time"] else 10**12,
+                -item["unread_count"],
+                item["session_key"],
+            ))
+            return rows
         if "__monaGlobalStore" in script:
             buyer_conversation_id = ""
             if self.current_buyer_id:
@@ -92,9 +129,9 @@ class FakePage:
                 "currentBuyerConversationId": buyer_conversation_id,
                 "historyBuyers": [row["buyer_id"] for row in self.rows if "recent" in row.get("btm", "")],
                 "recentSystemConvList": [row["buyer_id"] for row in self.rows if "systemConv" in row.get("btm", "")],
-                "servicingBuyers": [],
-                "waitReplyBuyers": [],
-                "overThreeBuyers": [],
+                "servicingBuyers": list(self.runtime_servicing_buyers),
+                "waitReplyBuyers": list(self.runtime_wait_reply_buyers),
+                "overThreeBuyers": list(self.runtime_over_three_buyers),
                 "aiServerBuyers": [],
                 "autoReplyBuyers": [],
                 "humanReplyBuyers": [],
@@ -253,6 +290,144 @@ class DouDianSessionMockTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual(calls, [("send", "hello")])
         self.assertEqual(self.dd.page.current_conversation_id, self.fish_biz)
+
+    @patch("doudian.DouDian.time.sleep", return_value=None)
+    def test_get_next_new_message_prefetches_other_unread_sessions_while_returning_current(self, _sleep):
+        current_batch = [{
+            "index": "101",
+            "who": "叫Cookie",
+            "type": "text",
+            "content": "这是什么",
+        }]
+        other_batch = [{
+            "index": "201",
+            "who": "酸菜菜菜鱼",
+            "type": "text",
+            "content": "商品标题是什么",
+        }]
+
+        def fake_read_current_unread(*args, **kwargs):
+            if self.dd.get_current_session_key() == f"conv::biz:{self.cookie_biz}":
+                return list(current_batch)
+            return []
+
+        def fake_get_after_switch(*args, **kwargs):
+            if self.dd.get_current_session_key() == f"conv::biz:{self.fish_biz}":
+                return list(other_batch)
+            return []
+
+        self.dd.readCurrentUnread = fake_read_current_unread
+        self.dd._getAfterSwitchMsg = fake_get_after_switch
+        self.dd._get_visible_unread_conversation_rows = lambda: [
+            {
+                "index": 0,
+                "btm": "conversation_recent_0",
+                "title": "叫Cookie",
+                "text": "叫Cookie 重复来访 这是什么",
+                "selected": True,
+                "isUnread": True,
+            },
+            {
+                "index": 1,
+                "btm": "conversation_recent_1",
+                "title": "酸菜菜菜鱼",
+                "text": "酸菜菜菜鱼 商品标题是什么",
+                "selected": False,
+                "isUnread": True,
+            },
+        ]
+
+        first_batch = self.dd.getNextNewMessage()
+        self.assertEqual(first_batch, current_batch)
+        self.assertEqual(len(self.dd.prefetched_session_batches), 1)
+        self.assertIn(f"conv::biz:{self.fish_biz}", self.dd.prefetched_session_batch_keys)
+        self.assertEqual(self.dd.page.current_conversation_id, self.cookie_biz)
+
+        second_batch = self.dd.getNextNewMessage()
+        self.assertEqual(second_batch, other_batch)
+        self.assertEqual(self.dd.page.current_conversation_id, self.fish_biz)
+        self.assertEqual(len(self.dd.prefetched_session_batches), 0)
+        self.assertNotIn(f"conv::biz:{self.fish_biz}", self.dd.prefetched_session_batch_keys)
+
+    @patch("doudian.DouDian.time.sleep", return_value=None)
+    def test_get_next_new_message_prefetches_runtime_priority_sessions_without_unread_badge(self, _sleep):
+        current_batch = [{
+            "index": "101",
+            "who": "叫Cookie",
+            "type": "text",
+            "content": "这是什么",
+        }]
+        other_batch = [{
+            "index": "201",
+            "who": "酸菜菜菜鱼",
+            "type": "text",
+            "content": "材质是什么",
+        }]
+
+        def fake_read_current_unread(*args, **kwargs):
+            if self.dd.get_current_session_key() == f"conv::biz:{self.cookie_biz}":
+                return list(current_batch)
+            return []
+
+        def fake_get_after_switch(*args, **kwargs):
+            if self.dd.get_current_session_key() == f"conv::biz:{self.fish_biz}":
+                return list(other_batch)
+            return []
+
+        self.dd.readCurrentUnread = fake_read_current_unread
+        self.dd._getAfterSwitchMsg = fake_get_after_switch
+        self.dd._get_visible_unread_conversation_rows = lambda: []
+        self.dd._get_runtime_priority_session_candidates = lambda: [
+            {
+                "session_key": f"conv::biz:{self.fish_biz}",
+                "buyer_id": self.fish_buyer,
+                "countdown_time": 1,
+                "unread_count": 1,
+                "priority": 2,
+            }
+        ]
+
+        first_batch = self.dd.getNextNewMessage()
+        self.assertEqual(first_batch, current_batch)
+        self.assertEqual(len(self.dd.prefetched_session_batches), 1)
+        self.assertIn(f"conv::biz:{self.fish_biz}", self.dd.prefetched_session_batch_keys)
+        self.assertEqual(self.dd.page.current_conversation_id, self.cookie_biz)
+
+        second_batch = self.dd.getNextNewMessage()
+        self.assertEqual(second_batch, other_batch)
+        self.assertEqual(self.dd.page.current_conversation_id, self.fish_biz)
+        self.assertEqual(len(self.dd.prefetched_session_batches), 0)
+        self.assertNotIn(f"conv::biz:{self.fish_biz}", self.dd.prefetched_session_batch_keys)
+
+    @patch("doudian.DouDian.time.sleep", return_value=None)
+    def test_get_runtime_unreplied_sessions_prefers_wait_reply_and_countdown(self, _sleep):
+        self.dd.page.runtime_wait_reply_buyers = [self.fish_buyer]
+        self.dd.page.runtime_servicing_buyers = [self.cookie_buyer, self.fish_buyer]
+        self.dd.page.runtime_conversations = [
+            {
+                "id": self.cookie_biz,
+                "buyerId": self.cookie_buyer,
+                "unreadCount": 1,
+                "countdown": False,
+                "countdownTime": 0,
+                "closed": False,
+            },
+            {
+                "id": self.fish_biz,
+                "buyerId": self.fish_buyer,
+                "unreadCount": 0,
+                "countdown": True,
+                "countdownTime": 12,
+                "closed": False,
+            },
+        ]
+
+        rows = self.dd.get_runtime_unreplied_sessions()
+        self.assertEqual(rows[0]["session_key"], f"conv::biz:{self.fish_biz}")
+        self.assertTrue(rows[0]["in_wait_reply"])
+        self.assertTrue(rows[0]["countdown"])
+        self.assertEqual(rows[1]["session_key"], f"conv::biz:{self.cookie_biz}")
+        self.assertEqual(rows[1]["unread_count"], 1)
 
 
 if __name__ == "__main__":

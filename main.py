@@ -19,6 +19,7 @@ import time
 import random
 import re
 import queue
+from collections import deque
 from llm.cozeUtil import CozeUtil
 from llm.bailianUtil import BalianUtil
 from configUtil import *
@@ -559,6 +560,8 @@ class MainWindow(QMainWindow):
             product_only_waiting = {}
             processed_transfer_signatures = set()
             product_only_wait_seconds = 30
+            unreplied_since_by_session = {}
+            unreplied_last_snapshot = {}
             product_markers = [
                 '咨询商品:',
                 '我要咨询商品名称:',
@@ -692,23 +695,523 @@ class MainWindow(QMainWindow):
                 suffix = re.sub(r'[^0-9A-Za-z:_-]+', '_', str(suffix or "session"))[:64]
                 return f"{config_platform}_{llm_prefix}_{cache_key}_{suffix}"[:180]
 
-            def queue_llm_task(task):
-                session = task.get('session_key', '')
-                if session in llm_inflight_sessions:
-                    pending_tasks = llm_pending_by_session.setdefault(session, [])
-                    pending_tasks.append(task)
-                    self.updateWebView.emit(
-                        f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});"
-                    )
-                    return
-                llm_inflight_sessions.add(session)
-                llm_request_queue.put(task)
-                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
-
             llm_request_queue = queue.Queue()
             llm_result_queue = queue.Queue()
+            llm_ready_sessions = deque()
+            llm_ready_session_set = set()
             llm_inflight_sessions = set()
             llm_pending_by_session = {}
+            llm_session_wait_since = {}
+            llm_starvation_threshold_seconds = 8.0
+            llm_session_coalesce_seconds = 1.5
+            llm_grace_reply_remaining = 0
+            fetch_inflight_sessions = set()
+            fetch_cooldown_until = {}
+
+            def get_session_waiting_count(session):
+                pending_count = len(llm_pending_by_session.get(session, []))
+                if session in llm_inflight_sessions:
+                    pending_count += 1
+                return pending_count
+
+            def get_session_wait_anchor(session, fallback_ts=None):
+                if session in unreplied_since_by_session:
+                    return unreplied_since_by_session[session]
+                if fallback_ts is not None:
+                    return fallback_ts
+                return time.time()
+
+            def build_task_receive_msg(task):
+                questions = [str(q or '').strip() for q in (task.get('user_questions') or []) if str(q or '').strip()]
+                context_text = str(task.get('context_text') or '').strip()
+                if context_text:
+                    if not questions:
+                        return context_text
+                    if len(questions) == 1:
+                        return f"{context_text}\n用户问题:{questions[0]}"
+                    body = "\n".join(f"{idx + 1}. {question}" for idx, question in enumerate(questions))
+                    return (
+                        f"{context_text}\n"
+                        "用户连续提问如下，请按顺序逐条回答，只回答用户明确提到的问题，"
+                        "不要补充未被询问的信息，不要延伸介绍其他卖点：\n"
+                        f"{body}"
+                    )
+                if not questions:
+                    return str(task.get('receive_msg') or '').strip()
+                if len(questions) == 1:
+                    return questions[0]
+                body = "\n".join(f"{idx + 1}. {question}" for idx, question in enumerate(questions))
+                return (
+                    "用户连续提问如下，请按顺序逐条回答，只回答用户明确提到的问题，"
+                    "不要补充未被询问的信息：\n"
+                    f"{body}"
+                )
+
+            def can_merge_session_task(existing_task, new_task):
+                if not existing_task or not new_task:
+                    return False
+                if existing_task.get('fetch_only') or new_task.get('fetch_only'):
+                    return False
+                if existing_task.get('direct_reply') or new_task.get('direct_reply'):
+                    return False
+                if existing_task.get('priority') == 'urgent' or new_task.get('priority') == 'urgent':
+                    return False
+                if existing_task.get('target_session_key') != new_task.get('target_session_key'):
+                    return False
+                if existing_task.get('llm_user_key') != new_task.get('llm_user_key'):
+                    return False
+                if str(existing_task.get('context_text') or '') != str(new_task.get('context_text') or ''):
+                    return False
+                return True
+
+            def merge_session_task(existing_task, new_task):
+                merged_questions = [str(q or '').strip() for q in (existing_task.get('user_questions') or []) if str(q or '').strip()]
+                merged_questions.extend(
+                    [str(q or '').strip() for q in (new_task.get('user_questions') or []) if str(q or '').strip()]
+                )
+                existing_task['user_questions'] = merged_questions
+                existing_task['receive_msg'] = build_task_receive_msg(existing_task)
+                existing_task['chat_name'] = new_task.get('chat_name') or existing_task.get('chat_name', '')
+                existing_task['queued_at'] = min(
+                    float(existing_task.get('queued_at') or time.time()),
+                    float(new_task.get('queued_at') or time.time())
+                )
+                existing_task['wait_since'] = min(
+                    float(existing_task.get('wait_since') or existing_task.get('queued_at') or time.time()),
+                    float(new_task.get('wait_since') or new_task.get('queued_at') or time.time())
+                )
+                latest_question_ts = float(new_task.get('last_question_ts') or new_task.get('queued_at') or time.time())
+                existing_task['last_question_ts'] = max(
+                    float(existing_task.get('last_question_ts') or existing_task.get('queued_at') or time.time()),
+                    latest_question_ts
+                )
+                existing_task['coalesce_until'] = existing_task['last_question_ts'] + llm_session_coalesce_seconds
+                return existing_task
+
+            def sync_runtime_unreplied_sessions():
+                now_ts = time.time()
+                try:
+                    snapshot = dd.get_runtime_unreplied_sessions()
+                except Exception:
+                    snapshot = []
+                active_sessions = set()
+                latest_snapshot = {}
+                for item in snapshot:
+                    session_key = item.get('session_key', '')
+                    if not is_stable_session_key(session_key):
+                        continue
+                    active_sessions.add(session_key)
+                    latest_snapshot[session_key] = item
+                    if session_key not in unreplied_since_by_session:
+                        unreplied_since_by_session[session_key] = now_ts
+                        wait_hint = ''
+                        if item.get('countdown_time'):
+                            wait_hint = f" countdown={item.get('countdown_time')}"
+                        self.updateWebView.emit(
+                            f"py_add_msg({json.dumps(config_name+'|检测到未回复会话 session='+format_session_for_log(session_key)+' unread='+str(item.get('unread_count', 0))+wait_hint)});"
+                        )
+                    has_prefetched = session_key in getattr(dd, 'prefetched_session_batch_keys', set())
+                    if (
+                        session_key not in llm_pending_by_session
+                        and session_key not in llm_inflight_sessions
+                        and session_key not in fetch_inflight_sessions
+                        and not has_prefetched
+                        and now_ts >= float(fetch_cooldown_until.get(session_key, 0) or 0)
+                    ):
+                        queue_session_task({
+                            'session_key': session_key,
+                            'target_session_key': session_key,
+                            'chat_name': '',
+                            'fetch_only': True,
+                            'priority': 'urgent_fetch',
+                            'queued_at': now_ts,
+                            'wait_since': get_session_wait_anchor(session_key, now_ts),
+                        })
+                latest_snapshot_keys = set(unreplied_last_snapshot.keys())
+                for session_key in latest_snapshot_keys - active_sessions:
+                    if session_key in llm_pending_by_session or session_key in llm_inflight_sessions:
+                        continue
+                    unreplied_since_by_session.pop(session_key, None)
+                unreplied_last_snapshot.clear()
+                unreplied_last_snapshot.update(latest_snapshot)
+
+            def drain_same_session_messages(target_session_key, max_wait_seconds=2.2, idle_rounds=2):
+                if not is_stable_session_key(target_session_key):
+                    return []
+                drained = []
+                seen_keys = set()
+                deadline = time.time() + max_wait_seconds
+                idle_hits = 0
+                while time.time() < deadline and idle_hits < idle_rounds:
+                    time.sleep(min(wait, 0.35))
+                    try:
+                        current_session = dd.get_current_session_key()
+                    except Exception:
+                        current_session = ''
+                    if current_session != target_session_key:
+                        try:
+                            if not dd._switch_to_session(target_session_key):
+                                idle_hits += 1
+                                continue
+                        except Exception:
+                            idle_hits += 1
+                            continue
+                    try:
+                        extra_msgs = dd.readCurrentUnread(
+                            config_checked_greetings,
+                            config_greetings,
+                        )
+                    except Exception:
+                        extra_msgs = []
+                    if not extra_msgs:
+                        idle_hits += 1
+                        continue
+                    appended = 0
+                    for extra in extra_msgs:
+                        key = f"{extra.get('index', '')}::{extra.get('type', '')}::{(extra.get('content') or '').strip()}"
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        drained.append(extra)
+                        appended += 1
+                    if appended:
+                        idle_hits = 0
+                    else:
+                        idle_hits += 1
+                return drained
+
+            def final_drain_task_questions(task, max_wait_seconds=1.0, idle_rounds=1):
+                if not task or task.get('fetch_only') or task.get('direct_reply'):
+                    return task
+                if task.get('priority') == 'urgent':
+                    return task
+                target_session_key = task.get('target_session_key', '')
+                if not is_stable_session_key(target_session_key):
+                    return task
+                extra_msgs = drain_same_session_messages(
+                    target_session_key,
+                    max_wait_seconds=max_wait_seconds,
+                    idle_rounds=idle_rounds,
+                )
+                if not extra_msgs:
+                    return task
+                existing_questions = [
+                    str(q or '').strip()
+                    for q in (task.get('user_questions') or [])
+                    if str(q or '').strip()
+                ]
+                existing_set = set(existing_questions)
+                appended_questions = []
+                latest_question_ts = float(task.get('last_question_ts') or task.get('queued_at') or time.time())
+                for extra in extra_msgs:
+                    if extra.get('type') != 'text':
+                        continue
+                    question = str(extra.get('content') or '').strip()
+                    if not question or question in existing_set:
+                        continue
+                    existing_set.add(question)
+                    appended_questions.append(question)
+                    latest_question_ts = max(
+                        latest_question_ts,
+                        float(time.time())
+                    )
+                    if extra.get('who'):
+                        task['chat_name'] = extra.get('who')
+                if not appended_questions:
+                    return task
+                existing_questions.extend(appended_questions)
+                task['user_questions'] = existing_questions
+                task['last_question_ts'] = latest_question_ts
+                task['coalesce_until'] = latest_question_ts + llm_session_coalesce_seconds
+                self.updateWebView.emit(
+                    f"py_add_msg({json.dumps(config_name+'|发模型前最终收口，补充问题数:'+str(len(appended_questions)))});"
+                )
+                return task
+
+            def fetch_unreplied_session_batch(target_session_key, max_wait_seconds=1.2, idle_rounds=1):
+                if not is_stable_session_key(target_session_key):
+                    return []
+                previous_session = ''
+                try:
+                    previous_session = dd.get_current_session_key()
+                except Exception:
+                    previous_session = ''
+                switched = previous_session == target_session_key
+                if not switched:
+                    try:
+                        switched = dd._switch_to_session(target_session_key)
+                    except Exception:
+                        switched = False
+                if not switched:
+                    return []
+                try:
+                    current_session = dd.get_current_session_key()
+                    if current_session != target_session_key:
+                        return []
+                    if previous_session == target_session_key:
+                        msgs = dd.readCurrentUnread(config_checked_greetings, config_greetings)
+                    else:
+                        msgs = dd._getAfterSwitchMsg(config_checked_greetings, config_greetings)
+                    if msgs:
+                        extra_msgs = drain_same_session_messages(
+                            target_session_key,
+                            max_wait_seconds=max_wait_seconds,
+                            idle_rounds=idle_rounds,
+                        )
+                        if extra_msgs:
+                            msgs.extend(extra_msgs)
+                    return msgs
+                finally:
+                    if previous_session and previous_session != target_session_key:
+                        try:
+                            dd._switch_to_session(previous_session)
+                        except Exception:
+                            pass
+
+            def should_delay_for_coalesce(session, first_task, urgent_session='', starved_session=''):
+                if not first_task:
+                    return False
+                if first_task.get('direct_reply'):
+                    return False
+                if first_task.get('priority') == 'urgent':
+                    return False
+                if urgent_session == session or starved_session == session:
+                    return False
+                coalesce_until = float(first_task.get('coalesce_until') or 0)
+                if not coalesce_until:
+                    return False
+                anchor = float(llm_session_wait_since.get(session) or first_task.get('wait_since') or first_task.get('queued_at') or time.time())
+                now_ts = time.time()
+                if now_ts - anchor >= llm_starvation_threshold_seconds:
+                    return False
+                return now_ts < coalesce_until
+
+            def get_oldest_starved_session(exclude_session=''):
+                now_ts = time.time()
+                starved_session = ''
+                starved_since = None
+                for session, pending_tasks in llm_pending_by_session.items():
+                    if not pending_tasks:
+                        continue
+                    if session == exclude_session:
+                        continue
+                    waiting_since = llm_session_wait_since.get(session)
+                    if waiting_since is None:
+                        continue
+                    if now_ts - waiting_since < llm_starvation_threshold_seconds:
+                        continue
+                    if starved_since is None or waiting_since < starved_since:
+                        starved_session = session
+                        starved_since = waiting_since
+                return starved_session
+
+            def get_oldest_waiting_session(exclude_session=''):
+                waiting_session = ''
+                waiting_since = None
+                for session, pending_tasks in llm_pending_by_session.items():
+                    if not pending_tasks:
+                        continue
+                    if session == exclude_session:
+                        continue
+                    anchor = llm_session_wait_since.get(session)
+                    if anchor is None:
+                        first_task = pending_tasks[0] if pending_tasks else {}
+                        anchor = float(first_task.get('wait_since') or first_task.get('queued_at') or time.time())
+                    if waiting_since is None or anchor < waiting_since:
+                        waiting_session = session
+                        waiting_since = anchor
+                return waiting_session
+
+            def get_oldest_urgent_session(exclude_session=''):
+                urgent_session = ''
+                urgent_since = None
+                for session, pending_tasks in llm_pending_by_session.items():
+                    if not pending_tasks:
+                        continue
+                    if session == exclude_session:
+                        continue
+                    urgent_task = None
+                    for pending_task in pending_tasks:
+                        if pending_task.get('priority') in ('urgent', 'urgent_fetch'):
+                            urgent_task = pending_task
+                            break
+                    if not urgent_task:
+                        continue
+                    queued_at = float(urgent_task.get('queued_at') or time.time())
+                    if urgent_since is None or queued_at < urgent_since:
+                        urgent_session = session
+                        urgent_since = queued_at
+                return urgent_session
+
+            def pop_ready_session():
+                while llm_ready_sessions:
+                    session = llm_ready_sessions.popleft()
+                    llm_ready_session_set.discard(session)
+                    if llm_pending_by_session.get(session):
+                        return session
+                    llm_pending_by_session.pop(session, None)
+                return ''
+
+            def remove_ready_session(session):
+                if not session or session not in llm_ready_session_set:
+                    return
+                llm_ready_session_set.discard(session)
+                try:
+                    llm_ready_sessions.remove(session)
+                except ValueError:
+                    pass
+
+            def mark_session_ready(session):
+                if not session:
+                    return
+                if session in llm_inflight_sessions or session in llm_ready_session_set:
+                    return
+                if not llm_pending_by_session.get(session):
+                    return
+                llm_session_wait_since.setdefault(session, time.time())
+                llm_ready_sessions.append(session)
+                llm_ready_session_set.add(session)
+
+            def dispatch_task(session, task):
+                nonlocal llm_grace_reply_remaining
+                if task.get('fetch_only'):
+                    fetch_inflight_sessions.add(session)
+                    try:
+                        fetched_msgs = fetch_unreplied_session_batch(session, max_wait_seconds=1.2, idle_rounds=1)
+                        if fetched_msgs:
+                            dd._enqueue_prefetched_session_batch(session, fetched_msgs)
+                            fetch_cooldown_until[session] = time.time() + 1.0
+                            self.updateWebView.emit(
+                                f"py_add_msg({json.dumps(config_name+'|未回复会话已取题 session='+format_session_for_log(session)+' 条数:'+str(len(fetched_msgs)))});"
+                            )
+                        else:
+                            fetch_cooldown_until[session] = time.time() + 1.5
+                    finally:
+                        fetch_inflight_sessions.discard(session)
+                    return False
+                if 'direct_reply' in task:
+                    direct_reply = task.get('direct_reply', '')
+                    direct_chat = task.get('chat_name', '')
+                    direct_session_key = task.get('target_session_key', '')
+                    if direct_reply:
+                        sent_ok = send_reply_to_target(direct_session_key, direct_chat, direct_reply)
+                        if sent_ok and is_stable_session_key(direct_session_key):
+                            unreplied_since_by_session.pop(direct_session_key, None)
+                            unreplied_last_snapshot.pop(direct_session_key, None)
+                        self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
+                    if llm_pending_by_session.get(session):
+                        mark_session_ready(session)
+                    return False
+
+                task = final_drain_task_questions(task)
+                task['receive_msg'] = build_task_receive_msg(task)
+                llm_inflight_sessions.add(session)
+                llm_session_wait_since.pop(session, None)
+                llm_request_queue.put(task)
+                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
+                return True
+
+            def schedule_next_session_task(preferred_session=''):
+                nonlocal llm_grace_reply_remaining
+                if llm_inflight_sessions:
+                    return
+                while True:
+                    urgent_session = get_oldest_urgent_session(exclude_session='')
+                    starved_session = get_oldest_starved_session(exclude_session=preferred_session)
+                    chosen_session = ''
+
+                    if urgent_session and urgent_session != preferred_session:
+                        chosen_session = urgent_session
+                        llm_grace_reply_remaining = 0
+                    elif preferred_session and llm_pending_by_session.get(preferred_session):
+                        if starved_session:
+                            if llm_grace_reply_remaining > 0:
+                                chosen_session = preferred_session
+                                llm_grace_reply_remaining -= 1
+                            else:
+                                chosen_session = starved_session
+                                llm_grace_reply_remaining = 0
+                        else:
+                            chosen_session = preferred_session
+                            llm_grace_reply_remaining = 0
+                    else:
+                        llm_grace_reply_remaining = 0
+                        chosen_session = starved_session or pop_ready_session()
+
+                    if not chosen_session:
+                        return
+
+                    remove_ready_session(chosen_session)
+                    pending_tasks = llm_pending_by_session.get(chosen_session) or []
+                    if not pending_tasks:
+                        llm_pending_by_session.pop(chosen_session, None)
+                        llm_session_wait_since.pop(chosen_session, None)
+                        if chosen_session == preferred_session:
+                            preferred_session = ''
+                        continue
+
+                    first_pending_task = pending_tasks[0]
+                    if len(pending_tasks) == 1 and should_delay_for_coalesce(
+                        chosen_session,
+                        first_pending_task,
+                        urgent_session=urgent_session,
+                        starved_session=starved_session,
+                    ):
+                        mark_session_ready(chosen_session)
+                        return
+
+                    urgent_task_index = next(
+                        (idx for idx, pending_task in enumerate(pending_tasks) if pending_task.get('priority') == 'urgent'),
+                        None
+                    )
+                    if urgent_task_index is None:
+                        task = pending_tasks.pop(0)
+                    else:
+                        task = pending_tasks.pop(urgent_task_index)
+                    if pending_tasks:
+                        llm_pending_by_session[chosen_session] = pending_tasks
+                    else:
+                        llm_pending_by_session.pop(chosen_session, None)
+                        llm_session_wait_since.pop(chosen_session, None)
+
+                    if dispatch_task(chosen_session, task):
+                        return
+
+                    if chosen_session == preferred_session and llm_pending_by_session.get(chosen_session):
+                        continue
+
+            def queue_session_task(task):
+                session = task.get('session_key', '')
+                if not session:
+                    return
+                task.setdefault('queued_at', time.time())
+                task.setdefault('wait_since', get_session_wait_anchor(session, task.get('queued_at')))
+                task.setdefault('last_question_ts', float(task.get('queued_at') or time.time()))
+                task.setdefault('coalesce_until', float(task.get('last_question_ts') or time.time()) + llm_session_coalesce_seconds)
+                pending_tasks = llm_pending_by_session.setdefault(session, [])
+                if pending_tasks and can_merge_session_task(pending_tasks[-1], task):
+                    merge_session_task(pending_tasks[-1], task)
+                    self.updateWebView.emit(
+                        f"py_add_msg({json.dumps(config_name+'|同会话连续问题已合并，当前合并条数:'+str(len(pending_tasks[-1].get('user_questions') or [])))});"
+                    )
+                    mark_session_ready(session)
+                    schedule_next_session_task()
+                    return
+                was_empty = len(pending_tasks) == 0
+                pending_tasks.append(task)
+                if was_empty and session not in llm_inflight_sessions:
+                    llm_session_wait_since[session] = float(task.get('wait_since') or get_session_wait_anchor(session, task.get('queued_at')) or time.time())
+                was_waiting = (
+                    session in llm_inflight_sessions
+                    or session in llm_ready_session_set
+                    or len(pending_tasks) > 1
+                )
+                mark_session_ready(session)
+                if was_waiting:
+                    self.updateWebView.emit(
+                        f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(get_session_waiting_count(session)))});"
+                    )
+                schedule_next_session_task()
 
             def llm_worker():
                 while not stop_event.is_set():
@@ -779,6 +1282,9 @@ class MainWindow(QMainWindow):
                             target_chat = result.get('chat_name', '')
                             target_session_key = result.get('target_session_key', '')
                             send_reply_to_target(target_session_key, target_chat, final_reply)
+                            if is_stable_session_key(target_session_key):
+                                unreplied_since_by_session.pop(target_session_key, None)
+                                unreplied_last_snapshot.pop(target_session_key, None)
                         except Exception as e:
                             err_text = str(e)
                             logging.error(err_text)
@@ -788,22 +1294,14 @@ class MainWindow(QMainWindow):
                         if js_reply:
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|'+js_reply)});")
                     if done_session:
-                        pending_tasks = llm_pending_by_session.get(done_session, [])
-                        while pending_tasks:
-                            pending_task = pending_tasks.pop(0)
-                            if pending_task.get('direct_reply'):
-                                direct_reply = pending_task.get('direct_reply', '')
-                                direct_chat = pending_task.get('chat_name', '')
-                                direct_session_key = pending_task.get('target_session_key', '')
-                                if direct_reply:
-                                    send_reply_to_target(direct_session_key, direct_chat, direct_reply)
-                                    self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
-                                continue
-                            llm_inflight_sessions.add(done_session)
-                            llm_request_queue.put(pending_task)
-                            break
-                        if not pending_tasks:
-                            llm_pending_by_session.pop(done_session, None)
+                        older_waiting_session = get_oldest_waiting_session(exclude_session=done_session)
+                        if older_waiting_session:
+                            llm_grace_reply_remaining = 0
+                        elif get_oldest_starved_session(exclude_session=done_session):
+                            llm_grace_reply_remaining = max(llm_grace_reply_remaining, 1)
+                        if llm_pending_by_session.get(done_session):
+                            mark_session_ready(done_session)
+                        schedule_next_session_task(preferred_session=done_session)
 
                 msgs = []
                 current_time = time.time()
@@ -811,6 +1309,8 @@ class MainWindow(QMainWindow):
                     print("Refreshing the page...")
                     dd.pageReload()  # 刷新页面
                     last_refresh_time = current_time  # 更新最后刷新时间
+                sync_runtime_unreplied_sessions()
+                schedule_next_session_task()
                 try:
                     # 持续监听消息，有消息则对接大模型进行回复 转人工依然获取 防止转机器后获取已经回复的
                     msgs = dd.getNextNewMessage(checkRedMessage=not manual_intervention,
@@ -843,6 +1343,9 @@ class MainWindow(QMainWindow):
                         self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|会话ID缺失，跳过本轮（避免串会话）')});")
                         time.sleep(wait)
                         continue
+                    extra_same_session_msgs = drain_same_session_messages(target_session_key)
+                    if extra_same_session_msgs:
+                        msgs.extend(extra_same_session_msgs)
                     batch_chat_name = ''
                     saw_user_text = False
                     pending_auto_intro = None
@@ -958,14 +1461,9 @@ class MainWindow(QMainWindow):
                                 'chat_name': chat_name,
                                 'target_session_key': target_session_key,
                                 'direct_reply': direct_reply,
+                                'wait_since': get_session_wait_anchor(cache_key),
                             }
-                            if cache_key in llm_inflight_sessions:
-                                pending_tasks = llm_pending_by_session.setdefault(cache_key, [])
-                                pending_tasks.append(direct_task)
-                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|当前会话正在处理中，已排队问题数:'+str(len(pending_tasks)))});")
-                            else:
-                                send_reply_to_target(target_session_key, chat_name, direct_reply)
-                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|回复消息::'+direct_reply)});")
+                            queue_session_task(direct_task)
                             time.sleep(wait)
                             continue
 
@@ -974,9 +1472,12 @@ class MainWindow(QMainWindow):
                             'chat_name': chat_name,
                             'target_session_key': target_session_key,
                             'receive_msg': receive_msg,
+                            'context_text': current_ctx['text'] if current_ctx and not any(m in receive_msg for m in product_markers) else '',
+                            'user_questions': [latest_user_text if current_ctx and not any(m in receive_msg for m in product_markers) else receive_msg],
                             'llm_user_key': build_llm_user_key(cache_key),
+                            'wait_since': get_session_wait_anchor(cache_key),
                         }
-                        queue_llm_task(task)
+                        queue_session_task(task)
 
                     if not saw_user_text and pending_auto_intro:
                         current_ctx = get_current_product_context(cache_key)
@@ -1022,8 +1523,11 @@ class MainWindow(QMainWindow):
                         'target_session_key': meta.get('target_session_key', ''),
                         'receive_msg': receive_msg,
                         'llm_user_key': build_llm_user_key(key),
+                        'priority': 'urgent',
+                        'queued_at': meta.get('ts', now_ts),
+                        'wait_since': min(meta.get('ts', now_ts), get_session_wait_anchor(key, meta.get('ts', now_ts))),
                     }
-                    queue_llm_task(task)
+                    queue_session_task(task)
                     expired_intro.append(key)
                 for key in expired_intro:
                     product_intro_waiting.pop(key, None)
