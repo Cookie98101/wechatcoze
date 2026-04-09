@@ -139,20 +139,80 @@ class PinDuoDuo():
                 self.playwright = None  # 确保清理
 
     # 转接其他人
+    def _get_visible_transfer_dialog_body(self, timeout_ms=8000):
+        deadline = time.time() + (max(timeout_ms, 1000) / 1000.0)
+        last_count = 0
+        while time.time() < deadline:
+            dialog_bodies = self.page.locator('.el-dialog__body')
+            try:
+                last_count = dialog_bodies.count()
+            except Exception:
+                last_count = 0
+            for idx in range(last_count):
+                body = dialog_bodies.nth(idx)
+                try:
+                    if not body.is_visible():
+                        continue
+                    if body.locator('.search-box .el-input__inner').count() <= 0:
+                        continue
+                    return body
+                except Exception:
+                    continue
+            time.sleep(0.2)
+        raise Exception(f"转接弹窗未就绪，检测到{last_count}个dialog body，但没有可用的转接弹窗")
+
+    def _get_visible_transfer_popover(self, timeout_ms=10000):
+        deadline = time.time() + (max(timeout_ms, 1000) / 1000.0)
+        selector = 'div.el-popover.el-popper.none-padding-popover.transform-list-popover'
+        last_count = 0
+        while time.time() < deadline:
+            popovers = self.page.locator(selector)
+            try:
+                last_count = popovers.count()
+            except Exception:
+                last_count = 0
+            for idx in range(last_count):
+                popover = popovers.nth(idx)
+                try:
+                    if popover.is_visible():
+                        return popover
+                except Exception:
+                    continue
+            time.sleep(0.2)
+        raise Exception(f"转接原因弹层未出现，检测到{last_count}个候选弹层")
+
+    def _get_transfer_entry_button(self):
+        selectors = [
+            '.transfer-chat-wrap:visible',
+            '.transfer-chat-item-btn:visible',
+            '.transfer-chat-wrap',
+            '.transfer-chat-item-btn',
+        ]
+        for selector in selectors:
+            locator = self.page.locator(selector)
+            try:
+                count = locator.count()
+            except Exception:
+                count = 0
+            if count > 0:
+                return locator.first
+        raise Exception("未找到转移会话入口")
+
     def transferOther(self,other,single_transfer):
         # 定位并点击“转移会话”按钮
         # 根据提供的HTML结构，“转移会话”按钮位于包含特定类名的div内
-        transfer_session_button = self.page.locator('.transfer-chat-wrap')
-        transfer_session_button.click()
-        # 等待对话框加载完成
-        self.page.wait_for_selector('.el-dialog__body', state='visible')
+        transfer_session_button = self._get_transfer_entry_button()
+        transfer_session_button.click(force=True)
+        # 等待真正可操作的转接弹窗加载完成，而不是任意 dialog body
+        dialog_body = self._get_visible_transfer_dialog_body()
 
         is_find_transfer = False
 
         for name in other:
             single_transfer(name)
             # 定位搜索框并输入'wjy'
-            search_box = self.page.locator('.el-dialog__body .search-box .el-input__inner')
+            search_box = dialog_body.locator('.search-box .el-input__inner').first
+            search_box.fill('')
             search_box.fill(name)
 
             # 假设搜索结果会动态加载，可能需要等待一段时间或者监听某个事件
@@ -160,19 +220,14 @@ class PinDuoDuo():
 
             # 尝试定位第一个搜索结果的“转移”按钮
             try:
-                first_result_transfer_buttons = self.page.locator('.el-table__row .item-btn-transfer')
+                first_result_transfer_buttons = dialog_body.locator('.el-table__row .item-btn-transfer')
                 if first_result_transfer_buttons.count() > 0:
                     # 如果找到了至少一个“转移”按钮，则点击第一个
                     first_result_transfer_buttons.nth(0).click()
                     # 等待“其他转移原因”编辑框显示
-                    visible_popover = self.page.locator(
-                        'div.el-popover.el-popper.none-padding-popover.transform-list-popover'
-                        '[x-placement="bottom"]:not([style*="display: none"])'
-                    )
-                    # 等待弹框完全可见
-                    visible_popover.wait_for(state='visible', timeout=10000)
+                    visible_popover = self._get_visible_transfer_popover(timeout_ms=10000)
                     # 选择“其他转移原因”
-                    other_reason_input = visible_popover.locator('.transfer-remark-edit .el-input__inner')
+                    other_reason_input = visible_popover.locator('.transfer-remark-edit .el-input__inner').first
                     custom_reason_text = '智能触发'
                     other_reason_input.fill(custom_reason_text)
                     time.sleep(1)
@@ -266,10 +321,6 @@ class PinDuoDuo():
                 close_icon.click()
                 time.sleep(1)
                 print("已点击关闭按钮pickupServiceGuide")
-            else:
-                print("未找到关闭按钮")
-        else:
-            print("未找到父元素pickupServiceGuide")
 
         parent_installerContact = self.page.query_selector('.installerContact')
         if parent_installerContact:
@@ -278,10 +329,6 @@ class PinDuoDuo():
                 close_icon.click()
                 time.sleep(1)
                 print("已点击关闭按钮installerContact")
-            else:
-                print("未找到关闭按钮")
-        else:
-            print("未找到父元素installerContact")
 
         #  检测回复率提醒弹框
         modal = self.page.locator('div.content-modal:has-text("账号回复异常预警")')
@@ -302,10 +349,6 @@ class PinDuoDuo():
                 cancel_button.click()
                 time.sleep(1)
                 print("已点击 '今天不再提示' 按钮")
-            else:
-                print("未找到 '今天不再提示' 按钮")
-        else:
-            print("未找到符合条件的 modal-box")
         #检查账号在别处登录
         modal_other = self.page.locator('div.layer-box:has-text("网络出现问题，请检查后刷新")')
         if modal_other.count() > 0:

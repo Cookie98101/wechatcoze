@@ -1681,7 +1681,10 @@ class MainWindow(QMainWindow):
                     if receive_msg and transfer_name and transfer_keyword and any(s in receive_msg for s in transfer_keyword):
                         def single_transfer(name):
                             self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在转接给:'+name)});")
-                        pdd.transferOther(transfer_name,single_transfer)
+                        try:
+                            pdd.transferOther(transfer_name,single_transfer)
+                        except Exception as e:
+                            self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|转人工失败:'+str(e)[:80])});")
                         time.sleep(wait)
                         continue
                     self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|正在请求模型回复...')});")
@@ -1690,7 +1693,10 @@ class MainWindow(QMainWindow):
                         if '#转交#' in reply and transfer_name:
                             def single_transfer(name):
                                 self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|模型判断转交给:'+name)});")
-                            pdd.transferOther(transfer_name,single_transfer)
+                            try:
+                                pdd.transferOther(transfer_name,single_transfer)
+                            except Exception as e:
+                                self.updateWebView.emit(f"py_add_msg({json.dumps(config_name+'|模型转人工失败:'+str(e)[:80])});")
                         else:
                             try:
                                 reply = reply+'  '+ random.choice(random_reply_word) + random.choice(random_reply_character)
